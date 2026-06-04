@@ -18,6 +18,7 @@ public sealed class TcpTransfer : IDisposable
     private readonly ConcurrentDictionary<string, PeerInfo> _peerInfoMap = new();
     private readonly int _peerTimeoutSeconds;
     private CancellationTokenSource? _heartbeatCts;
+    private CancellationTokenSource? _connectionCts;
     private readonly object _connLock = new();
     private readonly string _localHostname;
     private bool _disposed;
@@ -45,6 +46,7 @@ public sealed class TcpTransfer : IDisposable
         _listener.Start();
         _listenerCts = new CancellationTokenSource();
         _heartbeatCts = new CancellationTokenSource();
+        _connectionCts = new CancellationTokenSource();
 
         _logger.Info($"TCP listener started on port {_tcpPort}");
 
@@ -92,7 +94,7 @@ public sealed class TcpTransfer : IDisposable
                 if (_connections.TryAdd(peer.PeerId, client))
                 {
                     _logger.Info($"Connected to peer {peer.Hostname} ({peer.IpAddress}:{peer.TcpPort})");
-                    _ = ReceiveLoop(peer.PeerId, client);
+                    _ = ReceiveLoop(peer.PeerId, client, _connectionCts!.Token);
                     return;
                 }
                 client.Close();
@@ -170,8 +172,8 @@ public sealed class TcpTransfer : IDisposable
                 };
                 if (_connections.TryAdd(peerId, client))
                 {
-                    _logger.Debug($"Incoming heartbeat connection from {peerId} accepted.");
-                    _ = ReceiveLoop(peerId, client);
+                    _logger.Debug($"Incoming connection from {peerId} accepted.");
+                    _ = ReceiveLoop(peerId, client, _connectionCts!.Token);
                 }
                 return;
             }
@@ -218,28 +220,31 @@ public sealed class TcpTransfer : IDisposable
         }
     }
 
-    private async Task ReceiveLoop(string peerId, TcpClient client)
+    private async Task ReceiveLoop(string peerId, TcpClient client, CancellationToken ct)
     {
+        var lastHeartbeat = DateTime.UtcNow;
         try
         {
             using var stream = client.GetStream();
-            while (client.Connected && !_disposed)
+            while (client.Connected && !ct.IsCancellationRequested)
             {
                 try
                 {
-                    var headerLen = await ReadInt32Async(stream, CancellationToken.None);
+                    var headerLen = await ReadInt32Async(stream, ct);
                     if (headerLen <= 0 || headerLen > 65536)
                     {
+                        _logger.Debug($"[{peerId}] Invalid header length {headerLen}, closing.");
                         break;
                     }
 
-                    var jsonBytes = await ReadExactlyAsync(stream, headerLen, CancellationToken.None);
+                    var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct);
                     var json = Encoding.UTF8.GetString(jsonBytes);
                     var packet = JsonSerializer.Deserialize<ClipboardPacket>(json);
                     if (packet == null) break;
 
                     if (packet.Type == "heartbeat")
                     {
+                        lastHeartbeat = DateTime.UtcNow;
                         if (!_connections.ContainsKey(peerId))
                         {
                             _connections[peerId] = client;
@@ -273,7 +278,7 @@ public sealed class TcpTransfer : IDisposable
                         if (packet.Size > 0)
                         {
                             if (packet.Size > MaxClipboardBytes) break;
-                            payload = await ReadExactlyAsync(stream, (int)packet.Size, CancellationToken.None);
+                            payload = await ReadExactlyAsync(stream, (int)packet.Size, ct);
                         }
                         ClipboardReceived?.Invoke(this, new ClipboardReceivedEventArgs(
                             packet.Hash, packet.Format,
@@ -282,12 +287,31 @@ public sealed class TcpTransfer : IDisposable
                     }
                 }
                 catch (OperationCanceledException) { break; }
-                catch (EndOfStreamException) { break; }
-                catch (IOException) { break; }
-                catch (SocketException) { break; }
+                catch (EndOfStreamException)
+                {
+                    _logger.Debug($"[{peerId}] Connection closed by remote.");
+                    break;
+                }
+                catch (IOException ex)
+                {
+                    _logger.Debug($"[{peerId}] IO error: {ex.Message}");
+                    break;
+                }
+                catch (SocketException ex)
+                {
+                    _logger.Debug($"[{peerId}] Socket error: {ex.Message}");
+                    break;
+                }
             }
         }
-        catch { }
+        catch (OperationCanceledException)
+        {
+            _logger.Debug($"[{peerId}] ReceiveLoop cancelled.");
+        }
+        catch (Exception ex)
+        {
+            _logger.Debug($"[{peerId}] Unexpected error in ReceiveLoop: {ex.Message}");
+        }
         finally
         {
             ClosePeerConnection(peerId);
@@ -295,7 +319,7 @@ public sealed class TcpTransfer : IDisposable
 
             if (_peerInfoMap.TryGetValue(peerId, out var peer) && !_disposed)
             {
-                _ = Task.Delay(5000).ContinueWith(_ =>
+                _ = Task.Delay(3000).ContinueWith(_ =>
                 {
                     if (!_disposed && !_connections.ContainsKey(peerId))
                         _ = ConnectToPeerWithReconnectAsync(peer);
@@ -407,6 +431,14 @@ public sealed class TcpTransfer : IDisposable
     private static async Task<byte[]> ReadExactlyAsync(NetworkStream stream, int count, CancellationToken ct)
     {
         if (count == 0) return [];
+
+        if (!stream.Socket.Poll(500_000, SelectMode.SelectRead))
+        {
+            await Task.Delay(500, ct);
+            if (!stream.Socket.Poll(500_000, SelectMode.SelectRead))
+                throw new EndOfStreamException();
+        }
+
         var buf = new byte[count];
         int offset = 0;
         while (offset < count)
@@ -424,6 +456,7 @@ public sealed class TcpTransfer : IDisposable
         _disposed = true;
         _listenerCts?.Cancel();
         _heartbeatCts?.Cancel();
+        _connectionCts?.Cancel();
 
         foreach (var c in _connections.Values)
         {
@@ -433,6 +466,7 @@ public sealed class TcpTransfer : IDisposable
         _listener?.Stop();
         _listenerCts?.Dispose();
         _heartbeatCts?.Dispose();
+        _connectionCts?.Dispose();
         _logger.Info("TcpTransfer disposed.");
     }
 }

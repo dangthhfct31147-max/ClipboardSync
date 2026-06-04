@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -18,18 +17,11 @@ public sealed class ClipboardMonitor : IDisposable
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
 
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
-
-    [DllImport("user32.dll")]
-    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
     private string _lastHash = string.Empty;
     private bool _isApplyingRemote;
     private readonly FileLogger _logger;
     private bool _disposed;
-    private IntPtr _messageWindowHwnd = IntPtr.Zero;
-    private GCHandle _selfHandle;
+    private Thread? _clipboardThread;
     private readonly object _hashLock = new();
     private readonly object _debounceLock = new();
     private DateTime _lastChangeTime = DateTime.MinValue;
@@ -46,76 +38,44 @@ public sealed class ClipboardMonitor : IDisposable
     public void Start()
     {
         _logger.Info("Starting clipboard monitor...");
-        _selfHandle = GCHandle.Alloc(this, GCHandleType.Normal);
-        var hwnd = GetOrCreateMessageWindow();
-        if (!AddClipboardFormatListener(hwnd))
+
+        _clipboardThread = new Thread(ClipboardThreadMain)
         {
-            _logger.Error("Failed to add clipboard format listener. Is the session interactive?");
-            return;
-        }
-        _logger.Info("Clipboard monitor started successfully.");
+            IsBackground = true,
+            Name = "ClipboardSync.ClipboardPump"
+        };
+        _clipboardThread.SetApartmentState(ApartmentState.STA);
+        _clipboardThread.Start();
     }
+
+    private void ClipboardThreadMain()
+    {
+        var form = new HiddenClipboardForm(this, _logger);
+        Application.Run(form);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool PostThreadMessage(int threadId, int msg, IntPtr wParam, IntPtr lParam);
 
     public void Stop()
     {
         _logger.Info("Stopping clipboard monitor...");
-        if (_messageWindowHwnd != IntPtr.Zero)
+
+        if (_clipboardThread != null && _clipboardThread.IsAlive)
         {
-            RemoveClipboardFormatListener(_messageWindowHwnd);
-            DestroyWindow(_messageWindowHwnd);
-            _messageWindowHwnd = IntPtr.Zero;
+            PostThreadMessage(_clipboardThread.ManagedThreadId, 0x0010, IntPtr.Zero, IntPtr.Zero);
+            if (!_clipboardThread.Join(3000))
+            {
+                _logger.Warn("Clipboard thread did not exit cleanly.");
+            }
         }
+
         _logger.Info("Clipboard monitor stopped.");
     }
 
-    private IntPtr GetOrCreateMessageWindow()
+    internal void OnClipboardUpdate()
     {
-        if (_messageWindowHwnd != IntPtr.Zero) return _messageWindowHwnd;
-
-        var className = "ClipboardSyncMsgWindow_" + Guid.NewGuid().ToString("N");
-        var wndClass = new WNDCLASS(className);
-        wndClass.lpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate!);
-        wndClass.hInstance = Marshal.GetHINSTANCE(typeof(ClipboardMonitor).Module);
-
-        RegisterClass(ref wndClass);
-
-        _messageWindowHwnd = CreateWindowEx(0, className, null, 0, 0, 0, 0, 0,
-            IntPtr.Zero, IntPtr.Zero, wndClass.hInstance, IntPtr.Zero);
-
-        SetWindowLongPtr(_messageWindowHwnd, GWL_USERDATA, GCHandle.ToIntPtr(_selfHandle));
-
-        return _messageWindowHwnd;
-    }
-
-    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam)
-    {
-        if (msg == WM_CLIPBOARDUPDATE && !_disposed)
-        {
-            OnClipboardChanged();
-        }
-        return DefWindowProc(hwnd, msg, wParam, lParam);
-    }
-
-    private readonly WndProcDelegate _wndProcDelegate = WndProcStatic;
-
-    private static IntPtr WndProcStatic(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam)
-    {
-        var userData = GetWindowLongPtr(hwnd, GWL_USERDATA);
-        if (userData == IntPtr.Zero) return DefWindowProc(hwnd, msg, wParam, lParam);
-
-        if (!GCHandle.FromIntPtr(userData).IsAllocated) return DefWindowProc(hwnd, msg, wParam, lParam);
-        var target = GCHandle.FromIntPtr(userData).Target;
-        if (target is not ClipboardMonitor monitor) return DefWindowProc(hwnd, msg, wParam, lParam);
-
-        return monitor.WndProc(hwnd, msg, wParam, lParam);
-    }
-
-    private void OnClipboardChanged()
-    {
-        if (_isApplyingRemote)
-        {
-            return;
-        }
+        if (_isApplyingRemote) return;
 
         try
         {
@@ -165,28 +125,20 @@ public sealed class ClipboardMonitor : IDisposable
 
             lock (_hashLock)
             {
-                if (hash == _lastHash)
-                {
-                    _logger.Debug("Clipboard hash unchanged, skipping.");
-                    return;
-                }
+                if (hash == _lastHash) return;
                 _lastHash = hash;
             }
 
             lock (_debounceLock)
             {
                 var now = DateTime.UtcNow;
-                if (hash == _debounceHash && (now - _lastChangeTime).TotalMilliseconds < DebounceMs)
-                {
-                    _logger.Debug("Clipboard debounced (rapid change).");
-                    return;
-                }
+                if (hash == _debounceHash && (now - _lastChangeTime).TotalMilliseconds < DebounceMs) return;
                 _debounceHash = hash;
                 _lastChangeTime = now;
             }
 
-            _logger.Debug($"Clipboard changed: format={format}, hash={hash[..Math.Min(16, hash.Length)]}...");
-            ClipboardChanged?.Invoke(this, new ClipboardChangedEventArgs(hash, format, textContent, imageData, filePaths));
+            var args = new ClipboardChangedEventArgs(hash, format, textContent, imageData, filePaths);
+            ClipboardChanged?.Invoke(this, args);
         }
         catch (Exception ex)
         {
@@ -202,30 +154,21 @@ public sealed class ClipboardMonitor : IDisposable
             if (text != null)
             {
                 Clipboard.SetText(text);
-                lock (_hashLock)
-                {
-                    _lastHash = ComputeHash(text);
-                }
+                lock (_hashLock) { _lastHash = ComputeHash(text); }
             }
             else if (image != null)
             {
                 using var ms = new MemoryStream(image);
                 var bmp = new System.Drawing.Bitmap(ms);
                 Clipboard.SetImage(bmp);
-                lock (_hashLock)
-                {
-                    _lastHash = ComputeHash(image);
-                }
+                lock (_hashLock) { _lastHash = ComputeHash(image); }
             }
             else if (files != null)
             {
                 var collection = new System.Collections.Specialized.StringCollection();
                 collection.AddRange(files.ToArray());
                 Clipboard.SetFileDropList(collection);
-                lock (_hashLock)
-                {
-                    _lastHash = ComputeHash(string.Join("|", files));
-                }
+                lock (_hashLock) { _lastHash = ComputeHash(string.Join("|", files)); }
             }
         }
         catch (Exception ex)
@@ -255,61 +198,59 @@ public sealed class ClipboardMonitor : IDisposable
         if (_disposed) return;
         _disposed = true;
         Stop();
-        if (_selfHandle.IsAllocated) _selfHandle.Free();
     }
 
-    private const int GWL_USERDATA = -21;
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr DefWindowProc(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    private static extern ushort RegisterClass(ref WNDCLASS lpWndClass);
-
-    [DllImport("user32.dll")]
-    private static extern IntPtr CreateWindowEx(int dwExStyle, string lpClassName, string? lpWindowName,
-        int dwStyle, int x, int y, int nWidth, int nHeight, IntPtr hWndParent, IntPtr hMenu,
-        IntPtr hInstance, IntPtr lpParam);
-
-    [DllImport("user32.dll")]
-    private static extern bool DestroyWindow(IntPtr hWnd);
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct WNDCLASS
+    private sealed class HiddenClipboardForm : Form
     {
-        public int style;
-        public IntPtr lpfnWndProc;
-        public int cbClsExtra;
-        public int cbWndExtra;
-        public IntPtr hInstance;
-        public IntPtr hIcon;
-        public IntPtr hCursor;
-        public IntPtr hbrBackground;
-        public string? lpszMenuName;
-        public string lpszClassName;
+        private const int WM_QUIT_FORM = 0x0010;
+        private readonly ClipboardMonitor _owner;
+        private readonly FileLogger _logger;
+        private bool _addedListener;
 
-        public WNDCLASS(string className)
+        public HiddenClipboardForm(ClipboardMonitor owner, FileLogger logger)
         {
-            style = 0;
-            lpfnWndProc = IntPtr.Zero;
-            cbClsExtra = 0;
-            cbWndExtra = 0;
-            hInstance = IntPtr.Zero;
-            hIcon = IntPtr.Zero;
-            hCursor = IntPtr.Zero;
-            hbrBackground = IntPtr.Zero;
-            lpszMenuName = null;
-            lpszClassName = className;
+            _owner = owner;
+            _logger = logger;
+            Text = "ClipboardSync";
+            ShowInTaskbar = false;
+            WindowState = FormWindowState.Minimized;
+            Size = new System.Drawing.Size(1, 1);
+            SetVisibleCore(false);
+
+            if (!AddClipboardFormatListener(Handle))
+            {
+                var err = Marshal.GetLastWin32Error();
+                _logger.Error($"Failed to add clipboard format listener. Win32 error: {err}");
+                return;
+            }
+
+            _addedListener = true;
+            _logger.Info("Clipboard monitor started (hidden Form on STA thread).");
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_CLIPBOARDUPDATE)
+            {
+                _owner.OnClipboardUpdate();
+            }
+            else if (m.Msg == WM_QUIT_FORM)
+            {
+                Close();
+                return;
+            }
+            base.WndProc(ref m);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (_addedListener && Handle != IntPtr.Zero)
+            {
+                RemoveClipboardFormatListener(Handle);
+            }
+            base.Dispose(disposing);
         }
     }
-
-    private delegate IntPtr WndProcDelegate(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 }
 
 public sealed class ClipboardChangedEventArgs : EventArgs

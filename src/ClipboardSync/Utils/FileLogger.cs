@@ -16,9 +16,16 @@ public sealed class FileLogger(string logPath)
         {
             try
             {
+                var dir = Path.GetDirectoryName(_logPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
                 File.AppendAllText(_logPath, logEntry + Environment.NewLine);
             }
-            catch { }
+            catch (Exception logEx)
+            {
+                Console.Error.WriteLine($"[FileLogger] Failed to write log to {_logPath}: {logEx.Message}");
+                Console.Error.WriteLine(logEntry);
+            }
         }
     }
 
