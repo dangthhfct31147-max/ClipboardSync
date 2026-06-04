@@ -30,12 +30,10 @@ if ($Uninstall) {
 }
 
 # Check .NET 10 runtime
-$installedRuntimes = dotnet --list-runtimes 2>&1 | Out-String
-$needsRuntime = $true
-if ($installedRuntimes -match "Microsoft\.WindowsDesktop\s+10\.0\.(\d+)") {
-    $needsRuntime = $false
-}
-if ($needsRuntime) {
+$runtimes = dotnet --list-runtimes 2>&1 | Out-String
+if ($runtimes -match "Microsoft\.WindowsDesktop\.App\s+10\.0\.\d+") {
+    Write-Host ".NET 10 Desktop Runtime detected." -ForegroundColor Green
+} else {
     Write-Host "ERROR: .NET 10 Desktop Runtime is not installed." -ForegroundColor Red
     Write-Host "Download from: https://dotnet.microsoft.com/download/dotnet/10.0" -ForegroundColor Yellow
     Write-Host "Install the x64 desktop runtime, then run this script again." -ForegroundColor Yellow
