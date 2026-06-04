@@ -1,6 +1,12 @@
-# .NET
+# Build output (framework-dependent)
 bin/
 obj/
+publish/
+out/
+
+# win-x64 RID output
+src/ClipboardSync/bin/
+src/ClipboardSync/obj/
 *.dll
 *.exe
 *.pdb
