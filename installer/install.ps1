@@ -29,11 +29,30 @@ if ($Uninstall) {
     exit 0
 }
 
+# Check .NET 10 runtime
+$installedRuntimes = dotnet --list-runtimes 2>&1 | Out-String
+$needsRuntime = $true
+if ($installedRuntimes -match "Microsoft\.WindowsDesktop\s+10\.0\.(\d+)") {
+    $needsRuntime = $false
+}
+if ($needsRuntime) {
+    Write-Host "ERROR: .NET 10 Desktop Runtime is not installed." -ForegroundColor Red
+    Write-Host "Download from: https://dotnet.microsoft.com/download/dotnet/10.0" -ForegroundColor Yellow
+    Write-Host "Install the x64 desktop runtime, then run this script again." -ForegroundColor Yellow
+    exit 1
+}
+
 Write-Host "Installing ClipboardSync..." -ForegroundColor Cyan
 
 if (-not (Test-Path $exePath)) {
     Write-Host "ERROR: ClipboardSync.exe not found at: $exePath" -ForegroundColor Red
-    Write-Host "Please build the project first: dotnet build" -ForegroundColor Yellow
+    Write-Host "Run publish.ps1 first to build the project." -ForegroundColor Yellow
+    exit 1
+}
+
+if (-not (Test-Path (Join-Path $PSScriptRoot "appsettings.json"))) {
+    Write-Host "ERROR: appsettings.json not found in installer folder." -ForegroundColor Red
+    Write-Host "Run publish.ps1 first to copy all required files." -ForegroundColor Yellow
     exit 1
 }
 
@@ -49,7 +68,7 @@ if ($svc) {
 
 & sc.exe create $serviceName binPath= "`"$exePath`"" start= auto DisplayName= "`"$displayName`"" error= ignore
 & sc.exe description $serviceName $description
-& sc.exe config $serviceName obj= "NT AUTHORITY\LocalService"
+& sc.exe config $serviceName obj= "NT AUTHORITY\NetworkService"
 & sc.exe failure $serviceName reset= 86400 actions= restart/60000/restart/60000/restart/60000
 
 Write-Host "Starting service..." -ForegroundColor Cyan
