@@ -66,7 +66,7 @@ if ($svc) {
 
 & sc.exe create $serviceName binPath= "`"$exePath`"" start= auto DisplayName= "`"$displayName`"" error= ignore
 & sc.exe description $serviceName $description
-& sc.exe config $serviceName obj= "NT AUTHORITY\NetworkService"
+& sc.exe config $serviceName obj= "LocalSystem"
 & sc.exe failure $serviceName reset= 86400 actions= restart/60000/restart/60000/restart/60000
 
 Write-Host "Starting service..." -ForegroundColor Cyan

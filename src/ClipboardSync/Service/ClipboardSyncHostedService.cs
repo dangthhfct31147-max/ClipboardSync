@@ -48,7 +48,10 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _peerManager.Start();
         _clipboardMonitor.Start();
 
-        _trayIcon.Initialize(_config.Sync, GetStatusText());
+        if (!ClipboardSyncService.IsServiceProcess)
+        {
+            _trayIcon.Initialize(_config.Sync, GetStatusText());
+        }
         _logger.Info("All services started.");
     }
 
@@ -64,7 +67,11 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _discovery.Dispose();
         _peerManager.Dispose();
         _tcpTransfer.Dispose();
-        _trayIcon.Dispose();
+
+        if (!ClipboardSyncService.IsServiceProcess)
+        {
+            _trayIcon.Dispose();
+        }
 
         _logger.Info("ClipboardSyncHostedService stopped.");
         await Task.CompletedTask;
@@ -92,7 +99,10 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
             };
 
             await _tcpTransfer.SendClipboardAsync(packet);
-            _trayIcon.UpdateStatus(GetStatusText());
+            if (!ClipboardSyncService.IsServiceProcess)
+            {
+                _trayIcon.UpdateStatus(GetStatusText());
+            }
             _logger.Debug($"Clipboard sent to peers: {e.Format}");
         }
         catch (Exception ex)
@@ -104,14 +114,20 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
     private void OnPeerConnected(object? sender, PeerInfo peer)
     {
         _tcpTransfer.RegisterPeer(peer);
-        _trayIcon.UpdateStatus(GetStatusText());
+        if (!ClipboardSyncService.IsServiceProcess)
+        {
+            _trayIcon.UpdateStatus(GetStatusText());
+        }
         _logger.Info($"Peer connected: {peer.Hostname}");
     }
 
     private void OnPeerDisconnected(object? sender, string peerId)
     {
         _tcpTransfer.UnregisterPeer(peerId);
-        _trayIcon.UpdateStatus(GetStatusText());
+        if (!ClipboardSyncService.IsServiceProcess)
+        {
+            _trayIcon.UpdateStatus(GetStatusText());
+        }
         _logger.Info($"Peer disconnected: {peerId}");
     }
 

@@ -6,6 +6,7 @@ var isService = Environment.UserInteractive == false
 
 if (isService)
 {
+    ClipboardSyncService.IsServiceProcess = true;
     ServiceBase.Run(new ClipboardSyncService());
 }
 else

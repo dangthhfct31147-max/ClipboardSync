@@ -12,6 +12,7 @@ public sealed class ClipboardSyncService : ServiceBase
 {
     private IHost? _host;
     private readonly FileLogger _logger;
+    public static bool IsServiceProcess { get; internal set; }
 
     public ClipboardSyncService()
     {
@@ -35,6 +36,8 @@ public sealed class ClipboardSyncService : ServiceBase
 
     protected override async void OnStart(string[] args)
     {
+        base.OnStart(args);
+        IsServiceProcess = true;
         _logger.Info("Service starting...");
         try
         {
