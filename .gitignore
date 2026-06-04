@@ -1,0 +1,32 @@
+# .NET
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.user
+*.suo
+*.cache
+*.DotSettings.user
+*.log
+
+# Build output
+publish/
+out/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+
+# Rider
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
