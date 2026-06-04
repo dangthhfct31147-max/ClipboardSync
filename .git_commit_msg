@@ -1,6 +1,5 @@
-Fix service timeout: run host on dedicated background thread
+Add EventLog fallback and null-safe logging for service startup
 
-_host.Start() is a blocking call that never returns until shutdown.
-SCM requires OnStart to return quickly to confirm the service started.
-Fix by running the entire host on a dedicated background thread so OnStart
-returns immediately to the SCM.
+When the file logger fails (no log directory), errors now write to
+Windows EventLog instead so startup failures are visible in Event Viewer.
+Also make logger nullable with null-conditional operators throughout.

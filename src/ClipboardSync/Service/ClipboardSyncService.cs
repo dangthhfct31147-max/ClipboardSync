@@ -1,4 +1,6 @@
+using System.Runtime.InteropServices;
 using System.ServiceProcess;
+using System.Threading;
 using ClipboardSync.Tray;
 using ClipboardSync.Utils;
 using Microsoft.Extensions.DependencyInjection;
@@ -11,17 +13,29 @@ namespace ClipboardSync.Service;
 public sealed class ClipboardSyncService : ServiceBase
 {
     private IHost? _host;
-    private readonly FileLogger _logger;
+    private FileLogger? _logger;
     public static bool IsServiceProcess { get; internal set; }
 
     public ClipboardSyncService()
     {
-        var logPath = GetLogPath();
-        _logger = new FileLogger(logPath);
+        try
+        {
+            var logDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolderOption.DoNotVerify),
+                "ClipboardSync", "logs");
+            Directory.CreateDirectory(logDir);
+            var logPath = Path.Combine(logDir, $"clipboardsync_{DateTime.Now:yyyyMMdd}.log");
+            _logger = new FileLogger(logPath);
+            _logger.Info("ClipboardSyncService created.");
+        }
+        catch (Exception ex)
+        {
+            WriteToEventLog($"Constructor failed: {ex}");
+            throw;
+        }
         ServiceName = "ClipboardSync";
         CanStop = true;
         CanShutdown = true;
-        _logger.Info("ClipboardSyncService created.");
     }
 
     public void StartService()
@@ -41,7 +55,7 @@ public sealed class ClipboardSyncService : ServiceBase
 
         var thread = new Thread(() =>
         {
-            _logger.Info("Service background thread starting...");
+            _logger?.Info("Service background thread starting...");
             try
             {
                 _host = Host.CreateDefaultBuilder()
@@ -52,7 +66,7 @@ public sealed class ClipboardSyncService : ServiceBase
                     })
                     .ConfigureServices((_, services) =>
                     {
-                        services.AddSingleton(_logger);
+                        services.AddSingleton(_logger!);
                         services.AddSingleton<AppConfig>(sp =>
                         {
                             var config = sp.GetRequiredService<IConfiguration>();
@@ -87,11 +101,13 @@ public sealed class ClipboardSyncService : ServiceBase
                     .UseConsoleLifetime(options => options.SuppressStatusMessages = true)
                     .Build();
 
+                _logger?.Info("Host built, starting...");
                 _host.Run();
             }
             catch (Exception ex)
             {
-                _logger.Error("Unhandled exception in service background thread", ex);
+                _logger?.Error("Unhandled exception in service background thread", ex);
+                WriteToEventLog($"Unhandled: {ex}");
             }
         })
         {
@@ -100,12 +116,24 @@ public sealed class ClipboardSyncService : ServiceBase
         };
 
         thread.Start();
-        _logger.Info("Service starting...");
+        _logger?.Info("Service starting...");
+    }
+
+    private static void WriteToEventLog(string message)
+    {
+        try
+        {
+            var source = "ClipboardSync";
+            if (!System.Diagnostics.EventLog.SourceExists(source))
+                System.Diagnostics.EventLog.CreateEventSource(source, "Application");
+            System.Diagnostics.EventLog.WriteEntry(source, message, System.Diagnostics.EventLogEntryType.Error);
+        }
+        catch { }
     }
 
     protected override void OnStop()
     {
-        _logger.Info("Service stopping...");
+        _logger?.Info("Service stopping...");
         Task.Run(async () =>
         {
             if (_host != null)
@@ -114,7 +142,7 @@ public sealed class ClipboardSyncService : ServiceBase
                 _host.Dispose();
                 _host = null;
             }
-            _logger.Info("Service stopped.");
+            _logger?.Info("Service stopped.");
         }).GetAwaiter().GetResult();
     }
 
@@ -122,15 +150,6 @@ public sealed class ClipboardSyncService : ServiceBase
     {
         OnStop();
         base.OnShutdown();
-    }
-
-    private static string GetLogPath()
-    {
-        var logDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "ClipboardSync", "logs");
-        Directory.CreateDirectory(logDir);
-        return Path.Combine(logDir, $"clipboardsync_{DateTime.Now:yyyyMMdd}.log");
     }
 
     private static string GetAppBasePath()
