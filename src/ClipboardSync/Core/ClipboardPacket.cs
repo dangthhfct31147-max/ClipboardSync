@@ -33,16 +33,28 @@ public sealed class DiscoveryPacket
     public required string Hostname { get; init; }
     public required string IpAddress { get; init; }
     public required int TcpPort { get; init; }
-    public string? AuthToken { get; init; }
+    public string? GroupId { get; init; }
+    public string? Proof { get; init; }
     public long Timestamp { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }
 
-    public sealed record PeerInfo
-    {
-        public required string PeerId { get; init; }
-        public required string Hostname { get; init; }
-        public required string IpAddress { get; init; }
-        public required int TcpPort { get; init; }
-        public string? AuthToken { get; init; }
-        public DateTime LastSeen { get; set; } = DateTime.UtcNow;
-    }
+public sealed record PeerInfo
+{
+    public required string PeerId { get; init; }
+    public required string Hostname { get; init; }
+    public required string IpAddress { get; init; }
+    public required int TcpPort { get; init; }
+    public string? GroupId { get; init; }
+    public DateTime LastSeen { get; set; } = DateTime.UtcNow;
+}
+
+public sealed class SecureFrame
+{
+    public required string Type { get; init; }
+    public required string SenderId { get; init; }
+    public required long Timestamp { get; init; }
+    public required string Proof { get; init; }
+    public required byte[] Nonce { get; init; }
+    public required byte[] Ciphertext { get; init; }
+    public required byte[] Tag { get; init; }
+}

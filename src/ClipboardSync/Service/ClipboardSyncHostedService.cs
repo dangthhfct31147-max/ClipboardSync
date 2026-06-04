@@ -2,6 +2,7 @@ using ClipboardSync.Core;
 using ClipboardSync.Tray;
 using ClipboardSync.Utils;
 using Microsoft.Extensions.Hosting;
+using System.Text;
 
 namespace ClipboardSync.Service;
 
@@ -90,14 +91,15 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
                 Type = "clipboard",
                 Hash = e.Hash,
                 Format = e.Format,
-                Size = e.Format == ClipboardFormat.Image ? (e.ImageData?.Length ?? 0) : (e.TextContent?.Length ?? 0),
+                Size = e.Format == ClipboardFormat.Image
+                    ? (e.ImageData?.Length ?? 0)
+                    : Encoding.UTF8.GetByteCount(e.TextContent ?? string.Empty),
                 TextContent = e.TextContent,
                 ImageData = e.ImageData,
                 FilePaths = e.FilePaths,
                 SenderId = _discovery.LocalPeerId,
                 Hostname = _discovery.LocalHostname,
-                TcpPort = _config.Transfer.TcpPort,
-                Token = _config.Auth?.Token
+                TcpPort = _config.Transfer.TcpPort
             };
 
             await _tcpTransfer.SendClipboardAsync(packet);

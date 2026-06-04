@@ -18,7 +18,8 @@ public sealed class PeerDiscovery : IDisposable
     private readonly string _localPeerId;
     private readonly string _hostname;
     private readonly int _tcpPort;
-    private readonly string? _authToken;
+    private readonly string _authToken;
+    private readonly string _groupId;
     private readonly ConcurrentBag<IPAddress> _localIPs = [];
     private bool _disposed;
 
@@ -31,7 +32,8 @@ public sealed class PeerDiscovery : IDisposable
         _udpPort = config.Discovery.UdpPort;
         _broadcastIntervalSeconds = config.Discovery.BroadcastIntervalSeconds;
         _tcpPort = config.Transfer.TcpPort;
-        _authToken = config.Auth?.Token;
+        _authToken = config.Auth.RequireToken();
+        _groupId = SharedSecretAuth.CreateGroupId(_authToken);
         _localPeerId = GetOrCreatePeerId();
         _hostname = Environment.MachineName;
         DiscoverLocalIPs();
@@ -55,12 +57,18 @@ public sealed class PeerDiscovery : IDisposable
             {
                 if (ni.OperationalStatus != OperationalStatus.Up) continue;
                 if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                if (IsIgnoredNetworkInterface(ni.Name, ni.Description, ni.NetworkInterfaceType))
+                {
+                    _logger.Debug($"Ignoring non-LAN adapter: {ni.Name} ({ni.Description})");
+                    continue;
+                }
 
                 var props = ni.GetIPProperties();
                 foreach (var addr in props.UnicastAddresses)
                 {
                     if (addr.Address.AddressFamily == AddressFamily.InterNetwork &&
-                        !IPAddress.IsLoopback(addr.Address))
+                        !IPAddress.IsLoopback(addr.Address) &&
+                        !addr.Address.ToString().StartsWith("169.254.", StringComparison.Ordinal))
                     {
                         _localIPs.Add(addr.Address);
                         _logger.Debug($"Found local IP: {addr.Address} on {ni.Name}");
@@ -149,10 +157,17 @@ public sealed class PeerDiscovery : IDisposable
                 if (packet?.Type != "announce") continue;
                 if (packet.PeerId == _localPeerId) continue;
                 if (string.IsNullOrEmpty(packet.IpAddress)) continue;
-
-                if (!string.IsNullOrEmpty(_authToken) && packet.AuthToken != _authToken)
+                if (IsLocalAddress(packet.IpAddress, _localIPs) ||
+                    _localIPs.Any(ip => ip.Equals(result.RemoteEndPoint.Address)))
                 {
-                    _logger.Debug($"Discovery packet rejected: auth token mismatch from {packet.Hostname}");
+                    _logger.Debug($"Discovery packet ignored from local address {packet.IpAddress}");
+                    continue;
+                }
+
+                if (packet.GroupId != _groupId ||
+                    !SharedSecretAuth.VerifyProof(_authToken, packet.PeerId, packet.Timestamp, packet.Proof, TimeSpan.FromMinutes(2)))
+                {
+                    _logger.Debug($"Discovery packet rejected: auth proof mismatch from {packet.Hostname}");
                     continue;
                 }
 
@@ -162,7 +177,7 @@ public sealed class PeerDiscovery : IDisposable
                     Hostname = packet.Hostname,
                     IpAddress = packet.IpAddress,
                     TcpPort = packet.TcpPort,
-                    AuthToken = packet.AuthToken,
+                    GroupId = packet.GroupId,
                     LastSeen = DateTime.UtcNow
                 }));
             }
@@ -194,23 +209,25 @@ public sealed class PeerDiscovery : IDisposable
 
     private void BroadcastAnnounce()
     {
-        var packet = new DiscoveryPacket
-        {
-            Type = "announce",
-            PeerId = _localPeerId,
-            Hostname = _hostname,
-            IpAddress = _localIPs.FirstOrDefault()?.ToString() ?? "0.0.0.0",
-            TcpPort = _tcpPort,
-            AuthToken = _authToken
-        };
-
-        var json = JsonSerializer.Serialize(packet);
-        var data = Encoding.UTF8.GetBytes(json);
-
         foreach (var localIp in _localIPs)
         {
             try
             {
+                var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                var packet = new DiscoveryPacket
+                {
+                    Type = "announce",
+                    PeerId = _localPeerId,
+                    Hostname = _hostname,
+                    IpAddress = localIp.ToString(),
+                    TcpPort = _tcpPort,
+                    GroupId = _groupId,
+                    Proof = SharedSecretAuth.CreateProof(_authToken, _localPeerId, timestamp),
+                    Timestamp = timestamp
+                };
+                var json = JsonSerializer.Serialize(packet);
+                var data = Encoding.UTF8.GetBytes(json);
+
                 using var client = new UdpClient();
                 client.EnableBroadcast = true;
                 if (localIp.Equals(IPAddress.Loopback))
@@ -227,6 +244,40 @@ public sealed class PeerDiscovery : IDisposable
                 _logger.Debug($"Broadcast on {localIp} failed: {ex.Message}");
             }
         }
+    }
+
+    public static bool IsIgnoredNetworkInterface(string name, string description, NetworkInterfaceType type)
+    {
+        if (type is NetworkInterfaceType.Loopback or NetworkInterfaceType.Tunnel)
+            return true;
+
+        var text = $"{name} {description}".ToLowerInvariant();
+        string[] blocked =
+        [
+            "kaspersky",
+            "vpn",
+            "wireguard",
+            "wg",
+            "vethernet",
+            "hyper-v",
+            "virtual",
+            "default switch",
+            "wsl",
+            "docker",
+            "radmin",
+            "tailscale",
+            "zerotier",
+            "loopback"
+        ];
+
+        return blocked.Any(text.Contains);
+    }
+
+    public static bool IsLocalAddress(string? ipAddress, IEnumerable<IPAddress> localAddresses)
+    {
+        if (string.IsNullOrWhiteSpace(ipAddress)) return false;
+        if (!IPAddress.TryParse(ipAddress, out var parsed)) return false;
+        return localAddresses.Any(local => local.Equals(parsed));
     }
 
     public void Dispose()

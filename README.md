@@ -1,71 +1,63 @@
 # ClipboardSync
 
-P2P clipboard sync cho Windows - tu dong sync clipboard giua cac may Windows trong cung mang LAN, khong can server trung tam.
+Secure P2P clipboard sync for Windows. It syncs clipboard content between Windows machines on the same LAN without requiring the same Microsoft account or a central server.
 
-## Requirements
+## What It Does
 
-- Windows 10/11
-- No runtime required (self-contained build)
+- Runs as a current-user tray app, so it can access the Windows clipboard correctly.
+- Discovers peers on the LAN with UDP broadcast.
+- Transfers clipboard updates over TCP.
+- Uses a shared secret token so only paired machines join the same group.
+- Does not broadcast the raw token.
+- Encrypts clipboard payloads with AES-GCM before sending them over the LAN.
+- Syncs text and images by default. File drop-list sync is available but disabled by default.
 
-## Build & Install
-
-### 1. Build
+## Build
 
 ```powershell
-cd installer
+cd D:\work\Sync\installer
 .\publish.ps1
 ```
 
-This restores packages, publishes to `installer/`, and verifies all required files are present.
+The build is self-contained, so target machines do not need a separate .NET runtime.
 
-### 2. Install
+## Install And Pair Two Machines
+
+On the first machine:
 
 ```powershell
-cd installer
+cd D:\work\Sync\installer
 .\install.ps1
 ```
 
-This creates a startup shortcut so ClipboardSync runs automatically at logon.
-(Requires Administrator for Task Scheduler registration)
+If no token exists yet, the installer generates one and prints a pairing command.
 
-### Uninstall
+On the second machine, copy the same `installer` folder and run the printed command:
 
 ```powershell
-cd installer
+.\install.ps1 -Token "<token-from-first-machine>"
+```
+
+Keep the token private. Anyone with the token and LAN access can join the clipboard sync group.
+
+## Auto-Start
+
+`install.ps1` registers a current-user logon task. It does not require Administrator for normal installation.
+
+If Windows Firewall blocks peer discovery or transfer, run the installer once from an elevated PowerShell. In elevated mode it adds an inbound Private-network firewall rule for `ClipboardSync.exe`.
+
+## Uninstall
+
+```powershell
+cd D:\work\Sync\installer
 .\install.ps1 -Uninstall
 ```
 
-## Features
-
-- **P2P Discovery** - Cac may tu discover nhau qua UDP broadcast
-- **TCP Transfer** - Sync text, image, files qua persistent TCP connections
-- **User-Space App** - Chay trong user session, co quyen truy cap clipboard day du
-- **System Tray** - Icon + menu de control (toggle sync, xem peers, exit)
-- **Echo Prevention** - SHA256 hash-based de tranh sync loop
-- **Cross-format** - Sync text, PNG images, file drop lists
-
-## How It Works
-
-```
-ClipboardSync App (user session)
-  UDP Broadcast (port 51234) --> Peer Discovery
-  TCP Listener (port 51235) <-- Peer Manager
-              |                    |
-              v                    v
-  Clipboard Sync Engine
-  WM_CLIPBOARDUPDATE -> TCP -> Peers
-  Peers -> TCP -> Update clipboard (hash check)
-  System Tray Icon (NotifyIcon)
-```
-
-1. Moi may broadcast UDP packet moi 5 giay
-2. Khi phat hien may khac, thiet lap TCP connection
-3. Clipboard thay doi -> compute SHA256 hash -> gui qua TCP
-4. May nhan -> compare hash -> update clipboard neu khac
+This removes the startup task/shortcut and stops the running process. Application files are left in place.
 
 ## Config
 
-Chinh sua `installer/appsettings.json` sau khi publish:
+Edit `installer/appsettings.json` if you need custom ports or content options:
 
 ```json
 {
@@ -82,37 +74,33 @@ Chinh sua `installer/appsettings.json` sau khi publish:
     "SyncText": true,
     "SyncImages": true,
     "SyncFiles": false
+  },
+  "Auth": {
+    "Token": "<shared-secret-token>"
   }
 }
 ```
 
-## System Tray Menu
+The token must match on both machines.
 
-- **Status** - Hien thi so peers dang ket noi
-- **Peers** - Xem danh sach IP cua peers, click de copy
-- **Sync Enabled** - Toggle bat/tat sync
-- **Sync Text / Images / Files** - Toggle tung loai content
-- **Exit** - Dung app
+## Tray Menu
+
+- `Peers` shows connected machines.
+- `Sync Enabled` turns all sync on/off.
+- `Sync Text`, `Sync Images`, and `Sync Files` control each content type.
+- `Exit` stops the app.
 
 ## Logs
 
-```
+```text
 %LOCALAPPDATA%\ClipboardSync\logs\clipboardsync_YYYYMMDD.log
 ```
 
-Logs are automatically purged after 7 days.
-
 ## Troubleshooting
 
-**App doesn't appear in tray**
--> Kiem tra logs tai %LOCALAPPDATA%\ClipboardSync\logs\
--> Dam bao app da duoc install va khoi dong
+If peers do not connect:
 
-**Peers not connecting**
--> Dam bao cac may cung mang LAN
--> Kiem tra firewall cho phep UDP 51234 va TCP 51235
--> Kiem tra Auth Token giong nhau trong appsettings.json
-
-**Clipboard not syncing**
--> Kiem tra toggle trong tray menu (Sync Enabled, Sync Text/Images)
--> Restart app bang cach Exit va khoi dong lai
+- Make sure both machines are on the same LAN.
+- Make sure both machines use the same `Auth:Token`.
+- If needed, run `install.ps1` as Administrator once to add the firewall rule.
+- Check logs under `%LOCALAPPDATA%\ClipboardSync\logs\`.

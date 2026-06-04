@@ -19,6 +19,7 @@ src/ClipboardSync/obj/
 # Build output
 publish/
 out/
+installer/staged/
 
 # IDE
 .vs/

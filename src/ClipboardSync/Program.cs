@@ -7,10 +7,6 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
-Console.WriteLine("ClipboardSync");
-Console.WriteLine("Press Ctrl+C to stop, or close the window.");
-Console.WriteLine();
-
 // Resolve log dir and logger first — before any DI
 var appDataDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -86,18 +82,17 @@ try
         cts.Cancel();
     };
 
-    // Initialize tray icon immediately so user sees it
-    var config = host.Services.GetRequiredService<AppConfig>();
-    var trayIcon = host.Services.GetRequiredService<TrayIconManager>();
-    trayIcon.Initialize(config.Sync, "Starting...");
-
     logger.Info("Host built, starting services...");
     await host.RunAsync(cts.Token);
 }
 catch (Exception ex)
 {
     logger.Error("Unhandled exception", ex);
-    Console.WriteLine($"FATAL: {ex}");
+    MessageBox.Show(
+        $"ClipboardSync could not start.\n\n{ex.Message}\n\nSee logs in:\n{logDir}",
+        "ClipboardSync",
+        MessageBoxButtons.OK,
+        MessageBoxIcon.Error);
 }
 finally
 {

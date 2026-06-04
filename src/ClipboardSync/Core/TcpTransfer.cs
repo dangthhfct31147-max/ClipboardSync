@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using ClipboardSync.Utils;
@@ -11,7 +12,7 @@ public sealed class TcpTransfer : IDisposable
 {
     private readonly FileLogger _logger;
     private readonly int _tcpPort;
-    private readonly string? _authToken;
+    private readonly string _authToken;
     private TcpListener? _listener;
     private CancellationTokenSource? _listenerCts;
     private readonly ConcurrentDictionary<string, TcpClient> _connections = new();
@@ -21,9 +22,11 @@ public sealed class TcpTransfer : IDisposable
     private CancellationTokenSource? _connectionCts;
     private readonly object _connLock = new();
     private readonly string _localHostname;
+    private readonly string _localPeerId;
     private bool _disposed;
 
     private const int MaxClipboardBytes = 50 * 1024 * 1024;
+    private const int MaxSecureFrameBytes = 75 * 1024 * 1024;
     private const int SendTimeoutMs = 5000;
     private const int ReceiveTimeoutMs = 10000;
     private const int MaxReconnectAttempts = 3;
@@ -36,8 +39,9 @@ public sealed class TcpTransfer : IDisposable
         _logger = logger;
         _tcpPort = config.Transfer.TcpPort;
         _peerTimeoutSeconds = config.Discovery.PeerTimeoutSeconds;
-        _authToken = config.Auth?.Token;
+        _authToken = config.Auth.RequireToken();
         _localHostname = discovery.LocalHostname;
+        _localPeerId = discovery.LocalPeerId;
     }
 
     public Task StartAsync()
@@ -143,40 +147,28 @@ public sealed class TcpTransfer : IDisposable
         string? peerId = null;
         try
         {
-            using var stream = client.GetStream();
+            var stream = client.GetStream();
             var headerLen = await ReadInt32Async(stream, ct);
-            if (headerLen <= 0 || headerLen > 65536)
+            if (headerLen <= 0 || headerLen > MaxSecureFrameBytes)
             {
-                _logger.Warn($"Invalid header length: {headerLen}");
+                _logger.Warn($"Invalid secure frame length: {headerLen}");
                 return;
             }
 
             var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct, 10000);
-            var json = Encoding.UTF8.GetString(jsonBytes);
-            var packet = JsonSerializer.Deserialize<ClipboardPacket>(json);
-
-            if (packet == null)
-            {
-                _logger.Warn("Failed to deserialize packet header");
-                return;
-            }
-
-            if (!string.IsNullOrEmpty(_authToken) && packet.Token != _authToken)
-            {
-                _logger.Debug($"TCP connection rejected: auth token mismatch from sender {packet.SenderId}");
-                return;
-            }
+            var packet = DecodeSecureFrame(jsonBytes);
+            if (packet == null) return;
 
             if (packet.Type == "heartbeat")
             {
                 peerId = packet.SenderId;
                 _peerInfoMap[peerId] = _peerInfoMap.GetValueOrDefault(peerId) ?? new PeerInfo
-                {
-                    PeerId = peerId,
-                    Hostname = "Unknown",
-                    IpAddress = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString(),
-                    TcpPort = 0
-                };
+                    {
+                        PeerId = peerId,
+                        Hostname = packet.Hostname ?? "Unknown",
+                        IpAddress = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString(),
+                        TcpPort = packet.TcpPort
+                    };
                 if (_connections.TryAdd(peerId, client))
                 {
                     _logger.Debug($"Incoming connection from {peerId} accepted.");
@@ -187,16 +179,11 @@ public sealed class TcpTransfer : IDisposable
 
             if (packet.Type == "clipboard")
             {
-                if (packet.Size > MaxClipboardBytes)
+                if (packet.Size > MaxClipboardBytes ||
+                    (packet.ImageData?.Length ?? 0) > MaxClipboardBytes)
                 {
                     _logger.Warn($"Clipboard payload too large: {packet.Size} bytes, max {MaxClipboardBytes}");
                     return;
-                }
-
-                byte[] payload = [];
-                if (packet.Size > 0)
-                {
-                    payload = await ReadExactlyAsync(stream, (int)packet.Size, ct, (int)Math.Min(packet.Size * 2L + 1000, 60000));
                 }
 
                 var remoteIp = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
@@ -216,7 +203,7 @@ public sealed class TcpTransfer : IDisposable
 
                 ClipboardReceived?.Invoke(this, new ClipboardReceivedEventArgs(
                     packet.Hash, packet.Format,
-                    packet.TextContent, packet.ImageData ?? payload,
+                    packet.TextContent, packet.ImageData,
                     packet.FilePaths, packet.SenderId, packet.IsApplyingRemote));
             }
         }
@@ -238,16 +225,20 @@ public sealed class TcpTransfer : IDisposable
                 try
                 {
                     var headerLen = await ReadInt32Async(stream, ct);
-                    if (headerLen <= 0 || headerLen > 65536)
+                    if (headerLen <= 0 || headerLen > MaxSecureFrameBytes)
                     {
-                        _logger.Debug($"[{peerId}] Invalid header length {headerLen}, closing.");
+                        _logger.Debug($"[{peerId}] Invalid secure frame length {headerLen}, closing.");
                         break;
                     }
 
                     var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct, 10000);
-                    var json = Encoding.UTF8.GetString(jsonBytes);
-                    var packet = JsonSerializer.Deserialize<ClipboardPacket>(json);
+                    var packet = DecodeSecureFrame(jsonBytes);
                     if (packet == null) break;
+                    if (packet.SenderId != peerId)
+                    {
+                        _logger.Debug($"[{peerId}] Secure frame sender mismatch, closing.");
+                        break;
+                    }
 
                     if (packet.Type == "heartbeat")
                     {
@@ -281,15 +272,16 @@ public sealed class TcpTransfer : IDisposable
 
                     if (packet.Type == "clipboard")
                     {
-                        byte[] payload = [];
-                        if (packet.Size > 0)
+                        if (packet.Size > MaxClipboardBytes ||
+                            (packet.ImageData?.Length ?? 0) > MaxClipboardBytes)
                         {
-                            if (packet.Size > MaxClipboardBytes) break;
-                            payload = await ReadExactlyAsync(stream, (int)packet.Size, ct, (int)Math.Min(packet.Size * 2L + 1000, 60000));
+                            _logger.Warn($"[{peerId}] Clipboard payload too large: {packet.Size} bytes");
+                            break;
                         }
+
                         ClipboardReceived?.Invoke(this, new ClipboardReceivedEventArgs(
                             packet.Hash, packet.Format,
-                            packet.TextContent, packet.ImageData ?? payload,
+                            packet.TextContent, packet.ImageData,
                             packet.FilePaths, packet.SenderId, packet.IsApplyingRemote));
                     }
                 }
@@ -350,13 +342,11 @@ public sealed class TcpTransfer : IDisposable
                     Hash = "",
                     Format = ClipboardFormat.Text,
                     Size = 0,
-                    SenderId = "",
+                    SenderId = _localPeerId,
                     Hostname = _localHostname,
-                    TcpPort = _tcpPort,
-                    Token = _authToken
+                    TcpPort = _tcpPort
                 };
-                var json = JsonSerializer.Serialize(packet);
-                var headerBytes = Encoding.UTF8.GetBytes(json);
+                var headerBytes = EncodeSecureFrame(packet);
                 var lenBytes = BitConverter.GetBytes(headerBytes.Length);
 
                 List<string> deadConnections = [];
@@ -396,8 +386,7 @@ public sealed class TcpTransfer : IDisposable
             return;
         }
 
-        var json = JsonSerializer.Serialize(packet);
-        var headerBytes = Encoding.UTF8.GetBytes(json);
+        var headerBytes = EncodeSecureFrame(packet);
         var lenBytes = BitConverter.GetBytes(headerBytes.Length);
 
         // Snapshot connections under lock to avoid modification during iteration
@@ -423,15 +412,82 @@ public sealed class TcpTransfer : IDisposable
             var stream = client.GetStream();
             await stream.WriteAsync(headerLen);
             await stream.WriteAsync(headerBytes);
-
-            if (packet.ImageData?.Length > 0)
-            {
-                await stream.WriteAsync(packet.ImageData);
-            }
         }
         catch (Exception)
         {
             // Connection will be cleaned up by heartbeat
+        }
+    }
+
+    private byte[] EncodeSecureFrame(ClipboardPacket packet)
+    {
+        var plaintext = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
+        var encrypted = SharedSecretAuth.Encrypt(_authToken, plaintext);
+        var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var frame = new SecureFrame
+        {
+            Type = packet.Type,
+            SenderId = packet.SenderId,
+            Timestamp = timestamp,
+            Proof = SharedSecretAuth.CreateProof(_authToken, packet.SenderId, timestamp),
+            Nonce = encrypted.Nonce,
+            Ciphertext = encrypted.Ciphertext,
+            Tag = encrypted.Tag
+        };
+
+        return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(frame));
+    }
+
+    private ClipboardPacket? DecodeSecureFrame(byte[] frameBytes)
+    {
+        SecureFrame? frame;
+        try
+        {
+            frame = JsonSerializer.Deserialize<SecureFrame>(Encoding.UTF8.GetString(frameBytes));
+        }
+        catch (JsonException ex)
+        {
+            _logger.Debug($"Secure frame rejected: invalid JSON ({ex.Message})");
+            return null;
+        }
+
+        if (frame == null ||
+            string.IsNullOrWhiteSpace(frame.SenderId) ||
+            string.IsNullOrWhiteSpace(frame.Proof) ||
+            frame.Nonce == null ||
+            frame.Ciphertext == null ||
+            frame.Tag == null ||
+            frame.Nonce.Length != 12 ||
+            frame.Tag.Length != 16)
+        {
+            _logger.Debug("Secure frame rejected: missing required fields.");
+            return null;
+        }
+
+        if (!SharedSecretAuth.VerifyProof(_authToken, frame.SenderId, frame.Timestamp, frame.Proof, TimeSpan.FromMinutes(2)))
+        {
+            _logger.Debug($"Secure frame rejected: proof mismatch from sender {frame.SenderId}");
+            return null;
+        }
+
+        try
+        {
+            var plaintext = SharedSecretAuth.Decrypt(
+                _authToken,
+                new EncryptedPayload(frame.Nonce, frame.Ciphertext, frame.Tag));
+            var packet = JsonSerializer.Deserialize<ClipboardPacket>(Encoding.UTF8.GetString(plaintext));
+            if (packet?.SenderId != frame.SenderId || packet.Type != frame.Type)
+            {
+                _logger.Debug("Secure frame rejected: decrypted packet metadata mismatch.");
+                return null;
+            }
+
+            return packet;
+        }
+        catch (Exception ex) when (ex is CryptographicException or JsonException)
+        {
+            _logger.Debug($"Secure frame rejected: decrypt/deserialize failed ({ex.Message})");
+            return null;
         }
     }
 
