@@ -11,6 +11,7 @@ public sealed class TcpTransfer : IDisposable
 {
     private readonly FileLogger _logger;
     private readonly int _tcpPort;
+    private readonly string? _authToken;
     private TcpListener? _listener;
     private CancellationTokenSource? _listenerCts;
     private readonly ConcurrentDictionary<string, TcpClient> _connections = new();
@@ -18,6 +19,7 @@ public sealed class TcpTransfer : IDisposable
     private readonly int _peerTimeoutSeconds;
     private CancellationTokenSource? _heartbeatCts;
     private readonly object _connLock = new();
+    private readonly string _localHostname;
     private bool _disposed;
 
     private const int MaxClipboardBytes = 50 * 1024 * 1024;
@@ -26,11 +28,13 @@ public sealed class TcpTransfer : IDisposable
 
     public event EventHandler<ClipboardReceivedEventArgs>? ClipboardReceived;
 
-    public TcpTransfer(AppConfig config, FileLogger logger)
+    public TcpTransfer(AppConfig config, FileLogger logger, PeerDiscovery discovery)
     {
         _logger = logger;
         _tcpPort = config.Transfer.TcpPort;
         _peerTimeoutSeconds = config.Discovery.PeerTimeoutSeconds;
+        _authToken = config.Auth?.Token;
+        _localHostname = discovery.LocalHostname;
     }
 
     public Task StartAsync()
@@ -148,6 +152,12 @@ public sealed class TcpTransfer : IDisposable
                 return;
             }
 
+            if (!string.IsNullOrEmpty(_authToken) && packet.Token != _authToken)
+            {
+                _logger.Debug($"TCP connection rejected: auth token mismatch from sender {packet.SenderId}");
+                return;
+            }
+
             if (packet.Type == "heartbeat")
             {
                 peerId = packet.SenderId;
@@ -180,10 +190,25 @@ public sealed class TcpTransfer : IDisposable
                     payload = await ReadExactlyAsync(stream, (int)packet.Size, ct);
                 }
 
+                var remoteIp = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
+                if (!_connections.ContainsKey(packet.SenderId))
+                    _connections[packet.SenderId] = client;
+                if (!_peerInfoMap.ContainsKey(packet.SenderId))
+                {
+                    _peerInfoMap[packet.SenderId] = new PeerInfo
+                    {
+                        PeerId = packet.SenderId,
+                        Hostname = packet.Hostname ?? "Unknown",
+                        IpAddress = remoteIp,
+                        TcpPort = packet.TcpPort > 0 ? packet.TcpPort : 51235,
+                        LastSeen = DateTime.UtcNow
+                    };
+                }
+
                 ClipboardReceived?.Invoke(this, new ClipboardReceivedEventArgs(
                     packet.Hash, packet.Format,
                     packet.TextContent, packet.ImageData ?? payload,
-                    packet.FilePaths, packet.SenderId));
+                    packet.FilePaths, packet.SenderId, packet.IsApplyingRemote));
             }
         }
         catch (Exception ex)
@@ -198,14 +223,66 @@ public sealed class TcpTransfer : IDisposable
         try
         {
             using var stream = client.GetStream();
-            var buf = new byte[4];
             while (client.Connected && !_disposed)
             {
                 try
                 {
-                    var n = await stream.ReadAsync(buf.AsMemory());
-                    if (n == 0) break;
+                    var headerLen = await ReadInt32Async(stream, CancellationToken.None);
+                    if (headerLen <= 0 || headerLen > 65536)
+                    {
+                        break;
+                    }
+
+                    var jsonBytes = await ReadExactlyAsync(stream, headerLen, CancellationToken.None);
+                    var json = Encoding.UTF8.GetString(jsonBytes);
+                    var packet = JsonSerializer.Deserialize<ClipboardPacket>(json);
+                    if (packet == null) break;
+
+                    if (packet.Type == "heartbeat")
+                    {
+                        if (!_connections.ContainsKey(peerId))
+                        {
+                            _connections[peerId] = client;
+                        }
+                        if (_peerInfoMap.TryGetValue(peerId, out var existing) && existing.Hostname == "Unknown")
+                        {
+                            _peerInfoMap[peerId] = existing with
+                            {
+                                Hostname = packet.Hostname ?? existing.Hostname,
+                                IpAddress = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString(),
+                                TcpPort = packet.TcpPort > 0 ? packet.TcpPort : existing.TcpPort
+                            };
+                        }
+                        else if (!_peerInfoMap.ContainsKey(peerId))
+                        {
+                            _peerInfoMap[peerId] = new PeerInfo
+                            {
+                                PeerId = peerId,
+                                Hostname = packet.Hostname ?? "Unknown",
+                                IpAddress = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString(),
+                                TcpPort = packet.TcpPort > 0 ? packet.TcpPort : 51235,
+                                LastSeen = DateTime.UtcNow
+                            };
+                        }
+                        continue;
+                    }
+
+                    if (packet.Type == "clipboard")
+                    {
+                        byte[] payload = [];
+                        if (packet.Size > 0)
+                        {
+                            if (packet.Size > MaxClipboardBytes) break;
+                            payload = await ReadExactlyAsync(stream, (int)packet.Size, CancellationToken.None);
+                        }
+                        ClipboardReceived?.Invoke(this, new ClipboardReceivedEventArgs(
+                            packet.Hash, packet.Format,
+                            packet.TextContent, packet.ImageData ?? payload,
+                            packet.FilePaths, packet.SenderId, packet.IsApplyingRemote));
+                    }
                 }
+                catch (OperationCanceledException) { break; }
+                catch (EndOfStreamException) { break; }
                 catch (IOException) { break; }
                 catch (SocketException) { break; }
             }
@@ -242,7 +319,10 @@ public sealed class TcpTransfer : IDisposable
                     Hash = "",
                     Format = ClipboardFormat.Text,
                     Size = 0,
-                    SenderId = ""
+                    SenderId = "",
+                    Hostname = _localHostname,
+                    TcpPort = _tcpPort,
+                    Token = _authToken
                 };
                 var json = JsonSerializer.Serialize(packet);
                 var headerBytes = Encoding.UTF8.GetBytes(json);
@@ -256,7 +336,8 @@ public sealed class TcpTransfer : IDisposable
                     {
                         if (!client.Connected) continue;
                         var stream = client.GetStream();
-                await stream.WriteAsync(BitConverter.GetBytes(headerBytes.Length));
+                        await stream.WriteAsync(lenBytes);
+                        await stream.WriteAsync(headerBytes);
                     }
                     catch
                     {
@@ -364,8 +445,9 @@ public sealed class ClipboardReceivedEventArgs : EventArgs
     public byte[]? ImageData { get; }
     public List<string>? FilePaths { get; }
     public string SenderId { get; }
+    public bool IsApplyingRemote { get; }
 
-    public ClipboardReceivedEventArgs(string hash, ClipboardFormat format, string? text, byte[]? image, List<string>? files, string senderId)
+    public ClipboardReceivedEventArgs(string hash, ClipboardFormat format, string? text, byte[]? image, List<string>? files, string senderId, bool isApplyingRemote = false)
     {
         Hash = hash;
         Format = format;
@@ -373,5 +455,6 @@ public sealed class ClipboardReceivedEventArgs : EventArgs
         ImageData = image;
         FilePaths = files;
         SenderId = senderId;
+        IsApplyingRemote = isApplyingRemote;
     }
 }

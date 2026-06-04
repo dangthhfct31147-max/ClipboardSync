@@ -42,6 +42,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _peerManager.PeerConnected += OnPeerConnected;
         _peerManager.PeerDisconnected += OnPeerDisconnected;
         _tcpTransfer.ClipboardReceived += OnClipboardReceived;
+        _discovery.NetworkChanged += OnNetworkChanged;
 
         await _discovery.StartAsync();
         await _tcpTransfer.StartAsync();
@@ -62,6 +63,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _peerManager.PeerConnected -= OnPeerConnected;
         _peerManager.PeerDisconnected -= OnPeerDisconnected;
         _tcpTransfer.ClipboardReceived -= OnClipboardReceived;
+        _discovery.NetworkChanged -= OnNetworkChanged;
 
         _clipboardMonitor.Dispose();
         _discovery.Dispose();
@@ -95,7 +97,10 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
                 TextContent = e.TextContent,
                 ImageData = e.ImageData,
                 FilePaths = e.FilePaths,
-                SenderId = _discovery.LocalPeerId
+                SenderId = _discovery.LocalPeerId,
+                Hostname = _discovery.LocalHostname,
+                TcpPort = _config.Transfer.TcpPort,
+                Token = _config.Auth?.Token
             };
 
             await _tcpTransfer.SendClipboardAsync(packet);
@@ -131,12 +136,34 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _logger.Info($"Peer disconnected: {peerId}");
     }
 
+    private void OnNetworkChanged(object? sender, EventArgs e)
+    {
+        _logger.Info("Network changed, triggering peer re-discovery...");
+        _peerManager.ClearAndRediscover();
+        if (!ClipboardSyncService.IsServiceProcess)
+        {
+            _trayIcon.UpdateStatus(GetStatusText());
+        }
+    }
+
     private void OnClipboardReceived(object? sender, ClipboardReceivedEventArgs e)
     {
         if (!_config.Sync.Enabled) return;
         if (e.Format == ClipboardFormat.Text && !_config.Sync.SyncText) return;
         if (e.Format == ClipboardFormat.Image && !_config.Sync.SyncImages) return;
         if (e.Format == ClipboardFormat.Files && !_config.Sync.SyncFiles) return;
+
+        if (e.IsApplyingRemote)
+        {
+            _logger.Debug($"Received clipboard marked as remote-apply, skipping.");
+            return;
+        }
+
+        if (e.SenderId == _discovery.LocalPeerId)
+        {
+            _logger.Debug($"Received clipboard from self, skipping.");
+            return;
+        }
 
         try
         {

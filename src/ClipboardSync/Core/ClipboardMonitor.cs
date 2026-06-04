@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
+using ClipboardSync;
 using ClipboardSync.Utils;
 
 namespace ClipboardSync.Core;
@@ -24,16 +25,20 @@ public sealed class ClipboardMonitor : IDisposable
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
     private string _lastHash = string.Empty;
-    private bool _skipNextChange;
+    private bool _isApplyingRemote;
     private readonly FileLogger _logger;
     private bool _disposed;
     private IntPtr _messageWindowHwnd = IntPtr.Zero;
     private GCHandle _selfHandle;
     private readonly object _hashLock = new();
+    private readonly object _debounceLock = new();
+    private DateTime _lastChangeTime = DateTime.MinValue;
+    private string _debounceHash = string.Empty;
+    private const int DebounceMs = 150;
 
     public event EventHandler<ClipboardChangedEventArgs>? ClipboardChanged;
 
-    public ClipboardMonitor(FileLogger logger)
+    public ClipboardMonitor(AppConfig config, FileLogger logger)
     {
         _logger = logger;
     }
@@ -107,9 +112,8 @@ public sealed class ClipboardMonitor : IDisposable
 
     private void OnClipboardChanged()
     {
-        if (_skipNextChange)
+        if (_isApplyingRemote)
         {
-            _skipNextChange = false;
             return;
         }
 
@@ -169,6 +173,18 @@ public sealed class ClipboardMonitor : IDisposable
                 _lastHash = hash;
             }
 
+            lock (_debounceLock)
+            {
+                var now = DateTime.UtcNow;
+                if (hash == _debounceHash && (now - _lastChangeTime).TotalMilliseconds < DebounceMs)
+                {
+                    _logger.Debug("Clipboard debounced (rapid change).");
+                    return;
+                }
+                _debounceHash = hash;
+                _lastChangeTime = now;
+            }
+
             _logger.Debug($"Clipboard changed: format={format}, hash={hash[..Math.Min(16, hash.Length)]}...");
             ClipboardChanged?.Invoke(this, new ClipboardChangedEventArgs(hash, format, textContent, imageData, filePaths));
         }
@@ -180,7 +196,7 @@ public sealed class ClipboardMonitor : IDisposable
 
     public void UpdateClipboardSilently(string? text, byte[]? image, List<string>? files)
     {
-        _skipNextChange = true;
+        _isApplyingRemote = true;
         try
         {
             if (text != null)
@@ -215,7 +231,11 @@ public sealed class ClipboardMonitor : IDisposable
         catch (Exception ex)
         {
             _logger.Error("Error updating clipboard", ex);
-            _skipNextChange = false;
+            _isApplyingRemote = false;
+        }
+        finally
+        {
+            _isApplyingRemote = false;
         }
     }
 

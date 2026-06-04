@@ -18,11 +18,9 @@ public sealed class ClipboardSyncService : ServiceBase
 
     public ClipboardSyncService()
     {
+        var logDir = Path.Combine(GetAppBasePath(), "logs");
         try
         {
-            var logDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolderOption.DoNotVerify),
-                "ClipboardSync", "logs");
             Directory.CreateDirectory(logDir);
             var logPath = Path.Combine(logDir, $"clipboardsync_{DateTime.Now:yyyyMMdd}.log");
             _logger = new FileLogger(logPath);
@@ -67,7 +65,7 @@ public sealed class ClipboardSyncService : ServiceBase
                     .ConfigureServices((_, services) =>
                     {
                         services.AddSingleton(_logger!);
-                        services.AddSingleton<AppConfig>(sp =>
+                        services.AddSingleton(sp =>
                         {
                             var config = sp.GetRequiredService<IConfiguration>();
                             return new AppConfig
@@ -88,6 +86,10 @@ public sealed class ClipboardSyncService : ServiceBase
                                     SyncText = config.GetValue<bool>("Sync:SyncText", true),
                                     SyncImages = config.GetValue<bool>("Sync:SyncImages", true),
                                     SyncFiles = config.GetValue<bool>("Sync:SyncFiles", false)
+                                },
+                                Auth = new AuthConfig
+                                {
+                                    Token = config.GetValue<string>("Auth:Token")
                                 }
                             };
                         });

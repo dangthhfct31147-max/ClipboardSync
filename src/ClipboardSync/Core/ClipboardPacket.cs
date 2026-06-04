@@ -9,7 +9,7 @@ public enum ClipboardFormat
     Files
 }
 
-public sealed class ClipboardPacket
+    public sealed class ClipboardPacket
 {
     public required string Type { get; init; }
     public required string Hash { get; init; }
@@ -20,6 +20,10 @@ public sealed class ClipboardPacket
     public List<string>? FilePaths { get; init; }
     public required string SenderId { get; init; }
     public long Timestamp { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    public string? Hostname { get; init; }
+    public int TcpPort { get; init; }
+    public bool IsApplyingRemote { get; init; }
+    public string? Token { get; init; }
 }
 
 public sealed class DiscoveryPacket
@@ -29,6 +33,7 @@ public sealed class DiscoveryPacket
     public required string Hostname { get; init; }
     public required string IpAddress { get; init; }
     public required int TcpPort { get; init; }
+    public string? AuthToken { get; init; }
     public long Timestamp { get; init; } = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }
 
@@ -38,5 +43,6 @@ public sealed class DiscoveryPacket
         public required string Hostname { get; init; }
         public required string IpAddress { get; init; }
         public required int TcpPort { get; init; }
+        public string? AuthToken { get; init; }
         public DateTime LastSeen { get; set; } = DateTime.UtcNow;
     }

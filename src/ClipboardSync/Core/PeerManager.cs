@@ -62,6 +62,16 @@ public sealed class PeerManager : IDisposable
         }
     }
 
+    public void ClearAndRediscover()
+    {
+        foreach (var (id, peer) in _peers)
+        {
+            PeerDisconnected?.Invoke(this, id);
+        }
+        _peers.Clear();
+        _logger.Info("Peer list cleared, waiting for re-discovery.");
+    }
+
     private async Task CleanupLoop(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)

@@ -18,10 +18,12 @@ public sealed class PeerDiscovery : IDisposable
     private readonly string _localPeerId;
     private readonly string _hostname;
     private readonly int _tcpPort;
+    private readonly string? _authToken;
     private readonly ConcurrentBag<IPAddress> _localIPs = [];
     private bool _disposed;
 
     public event EventHandler<PeerDiscoveredEventArgs>? PeerDiscovered;
+    public event EventHandler? NetworkChanged;
 
     public PeerDiscovery(AppConfig config, FileLogger logger)
     {
@@ -29,13 +31,24 @@ public sealed class PeerDiscovery : IDisposable
         _udpPort = config.Discovery.UdpPort;
         _broadcastIntervalSeconds = config.Discovery.BroadcastIntervalSeconds;
         _tcpPort = config.Transfer.TcpPort;
+        _authToken = config.Auth?.Token;
         _localPeerId = GetOrCreatePeerId();
         _hostname = Environment.MachineName;
         DiscoverLocalIPs();
+
+        NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
+    }
+
+    private void OnNetworkAddressChanged(object? sender, EventArgs e)
+    {
+        _logger.Info("Network address changed, re-discovering local IPs...");
+        DiscoverLocalIPs();
+        NetworkChanged?.Invoke(this, EventArgs.Empty);
     }
 
     private void DiscoverLocalIPs()
     {
+        _localIPs.Clear();
         try
         {
             foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
@@ -70,11 +83,11 @@ public sealed class PeerDiscovery : IDisposable
 
     private static string GetOrCreatePeerId()
     {
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var idFile = Path.Combine(appData, "ClipboardSync", "peer.id");
+        var appData = Path.Combine(AppContext.BaseDirectory, "data");
+        var idFile = Path.Combine(appData, "peer.id");
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(idFile)!);
+            Directory.CreateDirectory(appData);
             if (File.Exists(idFile))
             {
                 var id = File.ReadAllText(idFile).Trim();
@@ -91,6 +104,7 @@ public sealed class PeerDiscovery : IDisposable
     }
 
     public string LocalPeerId => _localPeerId;
+    public string LocalHostname => _hostname;
 
     public Task StartAsync()
     {
@@ -134,12 +148,19 @@ public sealed class PeerDiscovery : IDisposable
                 if (packet.PeerId == _localPeerId) continue;
                 if (string.IsNullOrEmpty(packet.IpAddress)) continue;
 
+                if (!string.IsNullOrEmpty(_authToken) && packet.AuthToken != _authToken)
+                {
+                    _logger.Debug($"Discovery packet rejected: auth token mismatch from {packet.Hostname}");
+                    continue;
+                }
+
                 PeerDiscovered?.Invoke(this, new PeerDiscoveredEventArgs(new PeerInfo
                 {
                     PeerId = packet.PeerId,
                     Hostname = packet.Hostname,
                     IpAddress = packet.IpAddress,
                     TcpPort = packet.TcpPort,
+                    AuthToken = packet.AuthToken,
                     LastSeen = DateTime.UtcNow
                 }));
             }
@@ -177,7 +198,8 @@ public sealed class PeerDiscovery : IDisposable
             PeerId = _localPeerId,
             Hostname = _hostname,
             IpAddress = _localIPs.FirstOrDefault()?.ToString() ?? "0.0.0.0",
-            TcpPort = _tcpPort
+            TcpPort = _tcpPort,
+            AuthToken = _authToken
         };
 
         var json = JsonSerializer.Serialize(packet);
@@ -209,6 +231,7 @@ public sealed class PeerDiscovery : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
         _cts?.Cancel();
         _listener?.Dispose();
         _cts?.Dispose();

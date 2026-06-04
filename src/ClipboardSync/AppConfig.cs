@@ -5,6 +5,7 @@ public sealed class AppConfig
     public DiscoveryConfig Discovery { get; init; } = new();
     public TransferConfig Transfer { get; init; } = new();
     public SyncConfig Sync { get; init; } = new();
+    public AuthConfig Auth { get; init; } = new();
 }
 
 public sealed class DiscoveryConfig
@@ -25,4 +26,9 @@ public sealed class SyncConfig
     public bool SyncText { get; init; } = true;
     public bool SyncImages { get; init; } = true;
     public bool SyncFiles { get; init; }
+}
+
+public sealed class AuthConfig
+{
+    public string? Token { get; init; }
 }
