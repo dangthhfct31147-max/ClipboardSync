@@ -26,6 +26,8 @@ public sealed class TcpTransfer : IDisposable
     private const int MaxClipboardBytes = 50 * 1024 * 1024;
     private const int SendTimeoutMs = 5000;
     private const int ReceiveTimeoutMs = 10000;
+    private const int MaxReconnectAttempts = 3;
+    private const int MaxReconnectDelayMs = 30000;
 
     public event EventHandler<ClipboardReceivedEventArgs>? ClipboardReceived;
 
@@ -103,7 +105,12 @@ public sealed class TcpTransfer : IDisposable
             {
                 _logger.Debug($"Connection attempt {attempt + 1}/{maxAttempts} to {peer.Hostname} failed: {ex.Message}");
                 if (attempt < maxAttempts - 1)
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt)));
+                {
+                    var delay = Math.Min(
+                        (int)Math.Pow(2, attempt) * 1000,
+                        MaxReconnectDelayMs);
+                    await Task.Delay(delay);
+                }
             }
         }
 
@@ -144,7 +151,7 @@ public sealed class TcpTransfer : IDisposable
                 return;
             }
 
-            var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct);
+            var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct, 10000);
             var json = Encoding.UTF8.GetString(jsonBytes);
             var packet = JsonSerializer.Deserialize<ClipboardPacket>(json);
 
@@ -189,7 +196,7 @@ public sealed class TcpTransfer : IDisposable
                 byte[] payload = [];
                 if (packet.Size > 0)
                 {
-                    payload = await ReadExactlyAsync(stream, (int)packet.Size, ct);
+                    payload = await ReadExactlyAsync(stream, (int)packet.Size, ct, (int)Math.Min(packet.Size * 2L + 1000, 60000));
                 }
 
                 var remoteIp = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
@@ -237,7 +244,7 @@ public sealed class TcpTransfer : IDisposable
                         break;
                     }
 
-                    var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct);
+                    var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct, 10000);
                     var json = Encoding.UTF8.GetString(jsonBytes);
                     var packet = JsonSerializer.Deserialize<ClipboardPacket>(json);
                     if (packet == null) break;
@@ -278,7 +285,7 @@ public sealed class TcpTransfer : IDisposable
                         if (packet.Size > 0)
                         {
                             if (packet.Size > MaxClipboardBytes) break;
-                            payload = await ReadExactlyAsync(stream, (int)packet.Size, ct);
+                            payload = await ReadExactlyAsync(stream, (int)packet.Size, ct, (int)Math.Min(packet.Size * 2L + 1000, 60000));
                         }
                         ClipboardReceived?.Invoke(this, new ClipboardReceivedEventArgs(
                             packet.Hash, packet.Format,
@@ -392,18 +399,24 @@ public sealed class TcpTransfer : IDisposable
         var json = JsonSerializer.Serialize(packet);
         var headerBytes = Encoding.UTF8.GetBytes(json);
         var lenBytes = BitConverter.GetBytes(headerBytes.Length);
-        var tasks = new List<Task>();
 
-        foreach (var (peerId, client) in _connections)
+        // Snapshot connections under lock to avoid modification during iteration
+        List<(string PeerId, TcpClient Client)> snapshot;
+        lock (_connLock)
         {
-            if (!client.Connected) continue;
-            tasks.Add(Task.Run(() => SendToClient(client, peerId, lenBytes, headerBytes, packet)));
+            snapshot = _connections.Select(kv => (kv.Key, kv.Value)).ToList();
         }
 
+        var tasks = snapshot
+            .Where(kv => kv.Client.Connected)
+            .Select(kv => SendToClientAsync(kv.Client, kv.PeerId, lenBytes, headerBytes, packet))
+            .ToList();
+
+        if (tasks.Count == 0) return;
         try { await Task.WhenAll(tasks); } catch { }
     }
 
-    private static async Task SendToClient(TcpClient client, string peerId, byte[] headerLen, byte[] headerBytes, ClipboardPacket packet)
+    private async Task SendToClientAsync(TcpClient client, string peerId, byte[] headerLen, byte[] headerBytes, ClipboardPacket packet)
     {
         try
         {
@@ -424,30 +437,34 @@ public sealed class TcpTransfer : IDisposable
 
     private static async Task<int> ReadInt32Async(NetworkStream stream, CancellationToken ct)
     {
-        var buf = await ReadExactlyAsync(stream, 4, ct);
+        var buf = await ReadExactlyAsync(stream, 4, ct, timeoutMs: 10000);
         return BitConverter.ToInt32(buf, 0);
     }
 
-    private static async Task<byte[]> ReadExactlyAsync(NetworkStream stream, int count, CancellationToken ct)
+    private static async Task<byte[]> ReadExactlyAsync(NetworkStream stream, int count, CancellationToken ct, int timeoutMs = 10000)
     {
         if (count == 0) return [];
 
-        if (!stream.Socket.Poll(500_000, SelectMode.SelectRead))
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+
+        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested)
         {
-            await Task.Delay(500, ct);
-            if (!stream.Socket.Poll(500_000, SelectMode.SelectRead))
-                throw new EndOfStreamException();
+            if (stream.DataAvailable)
+            {
+                var buf = new byte[count];
+                int offset = 0;
+                while (offset < count)
+                {
+                    var n = await stream.ReadAsync(buf.AsMemory(offset, count - offset), ct);
+                    if (n == 0) throw new EndOfStreamException();
+                    offset += n;
+                }
+                return buf;
+            }
+            await Task.Delay(20, ct);
         }
 
-        var buf = new byte[count];
-        int offset = 0;
-        while (offset < count)
-        {
-            var n = await stream.ReadAsync(buf.AsMemory(offset, count - offset), ct);
-            if (n == 0) throw new EndOfStreamException();
-            offset += n;
-        }
-        return buf;
+        throw new TimeoutException($"ReadExactlyAsync timed out after {timeoutMs}ms waiting for {count} bytes");
     }
 
     public void Dispose()

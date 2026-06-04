@@ -20,8 +20,8 @@ if ($sdks -notmatch "10\.0\.300") {
 Write-Host "Restoring packages..." -ForegroundColor Cyan
 dotnet restore $projectPath 2>&1
 
-Write-Host "Publishing..." -ForegroundColor Cyan
-dotnet publish $projectPath -c Release -o $installerPath --no-self-contained 2>&1
+Write-Host "Publishing self-contained..." -ForegroundColor Cyan
+dotnet publish $projectPath -c Release -o $installerPath -r win-x64 --self-contained 2>&1
 
 # Verify output
 $exePath = Join-Path $installerPath "ClipboardSync.exe"

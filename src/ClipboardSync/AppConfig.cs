@@ -22,10 +22,10 @@ public sealed class TransferConfig
 
 public sealed class SyncConfig
 {
-    public bool Enabled { get; init; } = true;
-    public bool SyncText { get; init; } = true;
-    public bool SyncImages { get; init; } = true;
-    public bool SyncFiles { get; init; }
+    public bool Enabled { get; set; } = true;
+    public bool SyncText { get; set; } = true;
+    public bool SyncImages { get; set; } = true;
+    public bool SyncFiles { get; set; }
 }
 
 public sealed class AuthConfig

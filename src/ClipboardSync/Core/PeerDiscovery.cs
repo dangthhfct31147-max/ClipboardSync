@@ -83,7 +83,9 @@ public sealed class PeerDiscovery : IDisposable
 
     private static string GetOrCreatePeerId()
     {
-        var appData = Path.Combine(AppContext.BaseDirectory, "data");
+        var appData = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ClipboardSync", "data");
         var idFile = Path.Combine(appData, "peer.id");
         try
         {

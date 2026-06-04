@@ -1,5 +1,0 @@
-Add EventLog fallback and null-safe logging for service startup
-
-When the file logger fails (no log directory), errors now write to
-Windows EventLog instead so startup failures are visible in Event Viewer.
-Also make logger nullable with null-conditional operators throughout.

@@ -14,6 +14,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
     private readonly TrayIconManager _trayIcon;
     private readonly FileLogger _logger;
     private readonly AppConfig _config;
+    private readonly IHostApplicationLifetime _appLifetime;
     private bool _disposed;
 
     public ClipboardSyncHostedService(
@@ -23,7 +24,8 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         TcpTransfer tcpTransfer,
         TrayIconManager trayIcon,
         FileLogger logger,
-        AppConfig config)
+        AppConfig config,
+        IHostApplicationLifetime appLifetime)
     {
         _clipboardMonitor = clipboardMonitor;
         _discovery = discovery;
@@ -32,6 +34,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _trayIcon = trayIcon;
         _logger = logger;
         _config = config;
+        _appLifetime = appLifetime;
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -43,16 +46,13 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _peerManager.PeerDisconnected += OnPeerDisconnected;
         _tcpTransfer.ClipboardReceived += OnClipboardReceived;
         _discovery.NetworkChanged += OnNetworkChanged;
+        _trayIcon.ExitRequested += OnExitRequested;
 
         await _discovery.StartAsync();
         await _tcpTransfer.StartAsync();
         _peerManager.Start();
         _clipboardMonitor.Start();
-
-        if (!ClipboardSyncService.IsServiceProcess)
-        {
-            _trayIcon.Initialize(_config.Sync, GetStatusText());
-        }
+        _trayIcon.Initialize(_config.Sync, GetStatusText());
         _logger.Info("All services started.");
     }
 
@@ -64,16 +64,13 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _peerManager.PeerDisconnected -= OnPeerDisconnected;
         _tcpTransfer.ClipboardReceived -= OnClipboardReceived;
         _discovery.NetworkChanged -= OnNetworkChanged;
+        _trayIcon.ExitRequested -= OnExitRequested;
 
         _clipboardMonitor.Dispose();
         _discovery.Dispose();
         _peerManager.Dispose();
         _tcpTransfer.Dispose();
-
-        if (!ClipboardSyncService.IsServiceProcess)
-        {
-            _trayIcon.Dispose();
-        }
+        _trayIcon.Dispose();
 
         _logger.Info("ClipboardSyncHostedService stopped.");
         await Task.CompletedTask;
@@ -104,10 +101,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
             };
 
             await _tcpTransfer.SendClipboardAsync(packet);
-            if (!ClipboardSyncService.IsServiceProcess)
-            {
-                _trayIcon.UpdateStatus(GetStatusText());
-            }
+            _trayIcon.UpdateStatus(GetStatusText());
             _logger.Debug($"Clipboard sent to peers: {e.Format}");
         }
         catch (Exception ex)
@@ -119,20 +113,16 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
     private void OnPeerConnected(object? sender, PeerInfo peer)
     {
         _tcpTransfer.RegisterPeer(peer);
-        if (!ClipboardSyncService.IsServiceProcess)
-        {
-            _trayIcon.UpdateStatus(GetStatusText());
-        }
+        _trayIcon.UpdateStatus(GetStatusText());
+        _trayIcon.UpdatePeerList(_peerManager.GetPeers());
         _logger.Info($"Peer connected: {peer.Hostname}");
     }
 
     private void OnPeerDisconnected(object? sender, string peerId)
     {
         _tcpTransfer.UnregisterPeer(peerId);
-        if (!ClipboardSyncService.IsServiceProcess)
-        {
-            _trayIcon.UpdateStatus(GetStatusText());
-        }
+        _trayIcon.UpdateStatus(GetStatusText());
+        _trayIcon.UpdatePeerList(_peerManager.GetPeers());
         _logger.Info($"Peer disconnected: {peerId}");
     }
 
@@ -140,10 +130,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
     {
         _logger.Info("Network changed, triggering peer re-discovery...");
         _peerManager.ClearAndRediscover();
-        if (!ClipboardSyncService.IsServiceProcess)
-        {
-            _trayIcon.UpdateStatus(GetStatusText());
-        }
+        _trayIcon.UpdateStatus(GetStatusText());
     }
 
     private void OnClipboardReceived(object? sender, ClipboardReceivedEventArgs e)
@@ -187,6 +174,12 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         var peers = _peerManager.PeerCount;
         return peers == 0 ? "No peers connected"
             : $"Connected to {peers} peer{(peers == 1 ? "" : "s")}";
+    }
+
+    private void OnExitRequested(object? sender, EventArgs e)
+    {
+        _logger.Info("Exit requested from tray icon.");
+        _appLifetime.StopApplication();
     }
 
     public void Dispose()

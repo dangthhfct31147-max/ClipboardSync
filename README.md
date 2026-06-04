@@ -5,8 +5,7 @@ P2P clipboard sync cho Windows - tu dong sync clipboard giua cac may Windows tro
 ## Requirements
 
 - Windows 10/11
-- **.NET 10 Desktop Runtime** (download: https://dotnet.microsoft.com/download/dotnet/10.0)
-- .NET 10 SDK (only needed for building)
+- No runtime required (self-contained build)
 
 ## Build & Install
 
@@ -19,14 +18,15 @@ cd installer
 
 This restores packages, publishes to `installer/`, and verifies all required files are present.
 
-### 2. Install as Windows Service
+### 2. Install
 
 ```powershell
 cd installer
 .\install.ps1
 ```
 
-(Requires Administrator)
+This creates a startup shortcut so ClipboardSync runs automatically at logon.
+(Requires Administrator for Task Scheduler registration)
 
 ### Uninstall
 
@@ -35,17 +35,11 @@ cd installer
 .\install.ps1 -Uninstall
 ```
 
-## Run in Console Mode (for testing)
-
-```powershell
-.\src\ClipboardSync\bin\Release\net10.0-windows\ClipboardSync.exe
-```
-
 ## Features
 
 - **P2P Discovery** - Cac may tu discover nhau qua UDP broadcast
 - **TCP Transfer** - Sync text, image, files qua persistent TCP connections
-- **Windows Service** - Chay nen, auto-start on boot
+- **User-Space App** - Chay trong user session, co quyen truy cap clipboard day du
 - **System Tray** - Icon + menu de control (toggle sync, xem peers, exit)
 - **Echo Prevention** - SHA256 hash-based de tranh sync loop
 - **Cross-format** - Sync text, PNG images, file drop lists
@@ -53,7 +47,7 @@ cd installer
 ## How It Works
 
 ```
-ClipboardSync Service
+ClipboardSync App (user session)
   UDP Broadcast (port 51234) --> Peer Discovery
   TCP Listener (port 51235) <-- Peer Manager
               |                    |
@@ -98,7 +92,7 @@ Chinh sua `installer/appsettings.json` sau khi publish:
 - **Peers** - Xem danh sach IP cua peers, click de copy
 - **Sync Enabled** - Toggle bat/tat sync
 - **Sync Text / Images / Files** - Toggle tung loai content
-- **Exit** - Dung service
+- **Exit** - Dung app
 
 ## Logs
 
@@ -106,11 +100,19 @@ Chinh sua `installer/appsettings.json` sau khi publish:
 %LOCALAPPDATA%\ClipboardSync\logs\clipboardsync_YYYYMMDD.log
 ```
 
+Logs are automatically purged after 7 days.
+
 ## Troubleshooting
 
-**"Unable to start program" / "system cannot execute"**
--> Chay `.\publish.ps1` truoc, sau do `.\install.ps1`
+**App doesn't appear in tray**
+-> Kiem tra logs tai %LOCALAPPDATA%\ClipboardSync\logs\
+-> Dam bao app da duoc install va khoi dong
 
-**Service fails to start**
--> Kiem tra %LOCALAPPDATA%\ClipboardSync\logs\ cho loi chi tiet
--> Dam bao .NET 10 Desktop Runtime da duoc cai
+**Peers not connecting**
+-> Dam bao cac may cung mang LAN
+-> Kiem tra firewall cho phep UDP 51234 va TCP 51235
+-> Kiem tra Auth Token giong nhau trong appsettings.json
+
+**Clipboard not syncing**
+-> Kiem tra toggle trong tray menu (Sync Enabled, Sync Text/Images)
+-> Restart app bang cach Exit va khoi dong lai
