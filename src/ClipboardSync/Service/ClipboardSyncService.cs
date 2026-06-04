@@ -38,60 +38,69 @@ public sealed class ClipboardSyncService : ServiceBase
     {
         base.OnStart(args);
         IsServiceProcess = true;
-        _logger.Info("Service starting...");
-        try
-        {
-            _host = Host.CreateDefaultBuilder()
-                .ConfigureAppConfiguration((_, cfg) =>
-                {
-                    cfg.SetBasePath(GetAppBasePath());
-                    cfg.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
-                })
-                .ConfigureServices((_, services) =>
-                {
-                    services.AddSingleton(_logger);
-                    services.AddSingleton<AppConfig>(sp =>
-                    {
-                        var config = sp.GetRequiredService<IConfiguration>();
-                        return new AppConfig
-                        {
-                            Discovery = new DiscoveryConfig
-                            {
-                                UdpPort = config.GetValue<int>("Discovery:UdpPort", 51234),
-                                BroadcastIntervalSeconds = config.GetValue<int>("Discovery:BroadcastIntervalSeconds", 5),
-                                PeerTimeoutSeconds = config.GetValue<int>("Discovery:PeerTimeoutSeconds", 30)
-                            },
-                            Transfer = new TransferConfig
-                            {
-                                TcpPort = config.GetValue<int>("Transfer:TcpPort", 51235)
-                            },
-                            Sync = new SyncConfig
-                            {
-                                Enabled = config.GetValue<bool>("Sync:Enabled", true),
-                                SyncText = config.GetValue<bool>("Sync:SyncText", true),
-                                SyncImages = config.GetValue<bool>("Sync:SyncImages", true),
-                                SyncFiles = config.GetValue<bool>("Sync:SyncFiles", false)
-                            }
-                        };
-                    });
-                    services.AddSingleton<ClipboardMonitor>();
-                    services.AddSingleton<PeerDiscovery>();
-                    services.AddSingleton<PeerManager>();
-                    services.AddSingleton<TcpTransfer>();
-                    services.AddSingleton<TrayIconManager>();
-                    services.AddHostedService<ClipboardSyncHostedService>();
-                })
-                .UseConsoleLifetime(options => options.SuppressStatusMessages = true)
-                .Build();
 
-            _host.Start();
-            _logger.Info("Service started successfully.");
-        }
-        catch (Exception ex)
+        var thread = new Thread(() =>
         {
-            _logger.Error("Failed to start service", ex);
-            throw;
-        }
+            _logger.Info("Service background thread starting...");
+            try
+            {
+                _host = Host.CreateDefaultBuilder()
+                    .ConfigureAppConfiguration((_, cfg) =>
+                    {
+                        cfg.SetBasePath(GetAppBasePath());
+                        cfg.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+                    })
+                    .ConfigureServices((_, services) =>
+                    {
+                        services.AddSingleton(_logger);
+                        services.AddSingleton<AppConfig>(sp =>
+                        {
+                            var config = sp.GetRequiredService<IConfiguration>();
+                            return new AppConfig
+                            {
+                                Discovery = new DiscoveryConfig
+                                {
+                                    UdpPort = config.GetValue<int>("Discovery:UdpPort", 51234),
+                                    BroadcastIntervalSeconds = config.GetValue<int>("Discovery:BroadcastIntervalSeconds", 5),
+                                    PeerTimeoutSeconds = config.GetValue<int>("Discovery:PeerTimeoutSeconds", 30)
+                                },
+                                Transfer = new TransferConfig
+                                {
+                                    TcpPort = config.GetValue<int>("Transfer:TcpPort", 51235)
+                                },
+                                Sync = new SyncConfig
+                                {
+                                    Enabled = config.GetValue<bool>("Sync:Enabled", true),
+                                    SyncText = config.GetValue<bool>("Sync:SyncText", true),
+                                    SyncImages = config.GetValue<bool>("Sync:SyncImages", true),
+                                    SyncFiles = config.GetValue<bool>("Sync:SyncFiles", false)
+                                }
+                            };
+                        });
+                        services.AddSingleton<ClipboardMonitor>();
+                        services.AddSingleton<PeerDiscovery>();
+                        services.AddSingleton<PeerManager>();
+                        services.AddSingleton<TcpTransfer>();
+                        services.AddSingleton<TrayIconManager>();
+                        services.AddHostedService<ClipboardSyncHostedService>();
+                    })
+                    .UseConsoleLifetime(options => options.SuppressStatusMessages = true)
+                    .Build();
+
+                _host.Run();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Unhandled exception in service background thread", ex);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "ClipboardSync.Host"
+        };
+
+        thread.Start();
+        _logger.Info("Service starting...");
     }
 
     protected override void OnStop()

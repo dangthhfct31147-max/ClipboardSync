@@ -1,5 +1,6 @@
-Fix service timeout: synchronous OnStart instead of async void
+Fix service timeout: run host on dedicated background thread
 
-async void OnStart returns immediately after the first await, causing the
-Service Control Manager to timeout after 30 seconds. Fix by using
-synchronous _host.Start() which internally handles async initialization.
+_host.Start() is a blocking call that never returns until shutdown.
+SCM requires OnStart to return quickly to confirm the service started.
+Fix by running the entire host on a dedicated background thread so OnStart
+returns immediately to the SCM.
