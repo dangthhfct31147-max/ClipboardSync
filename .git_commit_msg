@@ -1,0 +1,5 @@
+Fix service timeout: synchronous OnStart instead of async void
+
+async void OnStart returns immediately after the first await, causing the
+Service Control Manager to timeout after 30 seconds. Fix by using
+synchronous _host.Start() which internally handles async initialization.

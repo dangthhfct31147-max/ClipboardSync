@@ -34,7 +34,7 @@ public sealed class ClipboardSyncService : ServiceBase
         OnStop();
     }
 
-    protected override async void OnStart(string[] args)
+    protected override void OnStart(string[] args)
     {
         base.OnStart(args);
         IsServiceProcess = true;
@@ -84,7 +84,7 @@ public sealed class ClipboardSyncService : ServiceBase
                 .UseConsoleLifetime(options => options.SuppressStatusMessages = true)
                 .Build();
 
-            await _host.StartAsync();
+            _host.Start();
             _logger.Info("Service started successfully.");
         }
         catch (Exception ex)
@@ -94,16 +94,19 @@ public sealed class ClipboardSyncService : ServiceBase
         }
     }
 
-    protected override async void OnStop()
+    protected override void OnStop()
     {
         _logger.Info("Service stopping...");
-        if (_host != null)
+        Task.Run(async () =>
         {
-            await _host.StopAsync();
-            _host.Dispose();
-            _host = null;
-        }
-        _logger.Info("Service stopped.");
+            if (_host != null)
+            {
+                await _host.StopAsync();
+                _host.Dispose();
+                _host = null;
+            }
+            _logger.Info("Service stopped.");
+        }).GetAwaiter().GetResult();
     }
 
     protected override void OnShutdown()
