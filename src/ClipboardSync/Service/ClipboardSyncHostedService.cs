@@ -46,6 +46,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _peerManager.PeerConnected += OnPeerConnected;
         _peerManager.PeerDisconnected += OnPeerDisconnected;
         _tcpTransfer.ClipboardReceived += OnClipboardReceived;
+        _tcpTransfer.PeerSeen += OnPeerSeen;
         _discovery.NetworkChanged += OnNetworkChanged;
         _trayIcon.ExitRequested += OnExitRequested;
 
@@ -64,6 +65,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _peerManager.PeerConnected -= OnPeerConnected;
         _peerManager.PeerDisconnected -= OnPeerDisconnected;
         _tcpTransfer.ClipboardReceived -= OnClipboardReceived;
+        _tcpTransfer.PeerSeen -= OnPeerSeen;
         _discovery.NetworkChanged -= OnNetworkChanged;
         _trayIcon.ExitRequested -= OnExitRequested;
 
@@ -126,6 +128,13 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _trayIcon.UpdateStatus(GetStatusText());
         _trayIcon.UpdatePeerList(_peerManager.GetPeers());
         _logger.Info($"Peer disconnected: {peerId}");
+    }
+
+    private void OnPeerSeen(object? sender, PeerInfo peer)
+    {
+        _peerManager.RegisterOrUpdatePeer(peer);
+        _trayIcon.UpdateStatus(GetStatusText());
+        _trayIcon.UpdatePeerList(_peerManager.GetPeers());
     }
 
     private void OnNetworkChanged(object? sender, EventArgs e)

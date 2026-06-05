@@ -17,9 +17,11 @@ var tests = new (string Name, Func<Task> Body)[]
     ("Encryption round-trips and rejects tampering", RunSync(EncryptionRoundTripsAndRejectsTampering)),
     ("Discovery ignores VPN and virtual adapters", RunSync(DiscoveryIgnoresVpnAndVirtualAdapters)),
     ("Discovery identifies local self addresses", RunSync(DiscoveryIdentifiesLocalSelfAddresses)),
+    ("Peer manager can refresh a peer from TCP liveness", RunSync(PeerManagerCanRefreshPeerFromTcpLiveness)),
     ("Single instance guard blocks a second running instance", SingleInstanceGuardBlocksSecondRunningInstance),
     ("Tray icon color reflects peer connection state", RunSync(TrayIconColorReflectsPeerConnectionState)),
     ("Outgoing TCP connection sends an initial heartbeat frame", OutgoingTcpConnectionSendsInitialHeartbeatFrame),
+    ("TCP heartbeat reports peer liveness", TcpHeartbeatReportsPeerLiveness),
     ("Inbound TCP connection stays open past the default heartbeat interval", InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval)
 };
 
@@ -116,6 +118,34 @@ void TrayIconColorReflectsPeerConnectionState()
     AssertEqual(Color.FromArgb(22, 163, 74), TrayIconManager.GetIconBackColorForPeerCount(2), "tray icon should stay green while any peer is connected");
 }
 
+void PeerManagerCanRefreshPeerFromTcpLiveness()
+{
+    var config = CreateTestConfig(tcpPort: 51235);
+    var logPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
+    var logger = new FileLogger(logPath);
+    using var discovery = new PeerDiscovery(config, logger);
+    using var manager = new PeerManager(config, logger, discovery);
+
+    var connectedCount = 0;
+    manager.PeerConnected += (_, _) => connectedCount++;
+
+    var stalePeer = new PeerInfo
+    {
+        PeerId = "remote-peer",
+        Hostname = "remote",
+        IpAddress = IPAddress.Loopback.ToString(),
+        TcpPort = 51235,
+        LastSeen = DateTime.UtcNow.AddMinutes(-5)
+    };
+
+    manager.RegisterOrUpdatePeer(stalePeer);
+    manager.RegisterOrUpdatePeer(stalePeer with { LastSeen = DateTime.UtcNow.AddMinutes(-4) });
+
+    AssertEqual(1, manager.PeerCount, "peer manager should contain the TCP-seen peer");
+    AssertEqual(1, connectedCount, "refreshing an existing peer should not emit duplicate connected events");
+    AssertTrue(manager.GetPeers().Single().LastSeen > DateTime.UtcNow.AddSeconds(-5), "TCP liveness should refresh LastSeen to now");
+}
+
 async Task SingleInstanceGuardBlocksSecondRunningInstance()
 {
     var mutexName = $"Local\\ClipboardSync.Tests.{Guid.NewGuid():N}";
@@ -145,17 +175,7 @@ async Task OutgoingTcpConnectionSendsInitialHeartbeatFrame()
     var localPort = ((IPEndPoint)localListener.LocalEndpoint).Port;
     localListener.Stop();
 
-    var config = new AppConfig
-    {
-        Discovery = new DiscoveryConfig
-        {
-            UdpPort = 0,
-            BroadcastIntervalSeconds = 5,
-            PeerTimeoutSeconds = 30
-        },
-        Transfer = new TransferConfig { TcpPort = localPort },
-        Auth = new AuthConfig { Token = token }
-    };
+    var config = CreateTestConfig(localPort);
 
     var logPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
     var logger = new FileLogger(logPath);
@@ -187,8 +207,34 @@ async Task OutgoingTcpConnectionSendsInitialHeartbeatFrame()
     finally
     {
         remoteListener.Stop();
-        if (File.Exists(logPath)) File.Delete(logPath);
     }
+}
+
+async Task TcpHeartbeatReportsPeerLiveness()
+{
+    const string token = "secret-token-for-two-windows-machines";
+    var localListener = new TcpListener(IPAddress.Loopback, 0);
+    localListener.Start();
+    var localPort = ((IPEndPoint)localListener.LocalEndpoint).Port;
+    localListener.Stop();
+
+    var config = CreateTestConfig(localPort);
+    var logPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
+    var logger = new FileLogger(logPath);
+    using var discovery = new PeerDiscovery(config, logger);
+    using var transfer = new TcpTransfer(config, logger, discovery);
+    using var client = new TcpClient();
+    var peerSeen = new TaskCompletionSource<PeerInfo>(TaskCreationOptions.RunContinuationsAsynchronously);
+    transfer.PeerSeen += (_, peer) => peerSeen.TrySetResult(peer);
+
+    await transfer.StartAsync();
+    await client.ConnectAsync(IPAddress.Loopback, localPort);
+    await WriteHeartbeatFrameForTestAsync(client.GetStream(), token, "remote-peer", 51235);
+    var peer = await AwaitWithTimeout(peerSeen.Task, TimeSpan.FromSeconds(2));
+
+    AssertEqual("remote-peer", peer.PeerId, "heartbeat should report the sender peer id");
+    AssertEqual("remote", peer.Hostname, "heartbeat should report the sender hostname");
+    AssertEqual(51235, peer.TcpPort, "heartbeat should report the sender TCP port");
 }
 
 async Task InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval()
@@ -199,17 +245,7 @@ async Task InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval()
     var localPort = ((IPEndPoint)localListener.LocalEndpoint).Port;
     localListener.Stop();
 
-    var config = new AppConfig
-    {
-        Discovery = new DiscoveryConfig
-        {
-            UdpPort = 0,
-            BroadcastIntervalSeconds = 5,
-            PeerTimeoutSeconds = 30
-        },
-        Transfer = new TransferConfig { TcpPort = localPort },
-        Auth = new AuthConfig { Token = token }
-    };
+    var config = CreateTestConfig(localPort);
 
     var logPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
     var logger = new FileLogger(logPath);
@@ -218,20 +254,25 @@ async Task InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval()
     using var client = new TcpClient();
 
     await transfer.StartAsync();
-    try
-    {
-        await client.ConnectAsync(IPAddress.Loopback, localPort);
-        await WriteHeartbeatFrameForTestAsync(client.GetStream(), token, "remote-peer", 51235);
-        await Task.Delay(TimeSpan.FromSeconds(11));
+    await client.ConnectAsync(IPAddress.Loopback, localPort);
+    await WriteHeartbeatFrameForTestAsync(client.GetStream(), token, "remote-peer", 51235);
+    await Task.Delay(TimeSpan.FromSeconds(11));
 
-        var log = File.Exists(logPath) ? await File.ReadAllTextAsync(logPath) : "";
-        AssertFalse(log.Contains("Connection to peer remote-peer closed.", StringComparison.Ordinal), "inbound connection should remain open while waiting for the next heartbeat");
-    }
-    finally
-    {
-        if (File.Exists(logPath)) File.Delete(logPath);
-    }
+    var log = File.Exists(logPath) ? await File.ReadAllTextAsync(logPath) : "";
+    AssertFalse(log.Contains("Connection to peer remote-peer closed.", StringComparison.Ordinal), "inbound connection should remain open while waiting for the next heartbeat");
 }
+
+AppConfig CreateTestConfig(int tcpPort) => new()
+{
+    Discovery = new DiscoveryConfig
+    {
+        UdpPort = 0,
+        BroadcastIntervalSeconds = 5,
+        PeerTimeoutSeconds = 30
+    },
+    Transfer = new TransferConfig { TcpPort = tcpPort },
+    Auth = new AuthConfig { Token = "secret-token-for-two-windows-machines" }
+};
 
 async Task WriteHeartbeatFrameForTestAsync(NetworkStream stream, string token, string senderId, int tcpPort)
 {

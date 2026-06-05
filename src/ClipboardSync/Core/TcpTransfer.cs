@@ -34,6 +34,7 @@ public sealed class TcpTransfer : IDisposable
     private const int MaxReconnectDelayMs = 30000;
 
     public event EventHandler<ClipboardReceivedEventArgs>? ClipboardReceived;
+    public event EventHandler<PeerInfo>? PeerSeen;
 
     public TcpTransfer(AppConfig config, FileLogger logger, PeerDiscovery discovery)
     {
@@ -177,13 +178,8 @@ public sealed class TcpTransfer : IDisposable
             if (packet.Type == "heartbeat")
             {
                 peerId = packet.SenderId;
-                _peerInfoMap[peerId] = _peerInfoMap.GetValueOrDefault(peerId) ?? new PeerInfo
-                    {
-                        PeerId = peerId,
-                        Hostname = packet.Hostname ?? "Unknown",
-                        IpAddress = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString(),
-                        TcpPort = packet.TcpPort
-                    };
+                var peer = CreatePeerInfo(packet, client);
+                TrackPeerSeen(peer);
                 if (_connections.TryAdd(peerId, client))
                 {
                     _logger.Debug($"Incoming connection from {peerId} accepted.");
@@ -258,29 +254,10 @@ public sealed class TcpTransfer : IDisposable
                     if (packet.Type == "heartbeat")
                     {
                         lastHeartbeat = DateTime.UtcNow;
+                        TrackPeerSeen(CreatePeerInfo(packet, client));
                         if (!_connections.ContainsKey(peerId))
                         {
                             _connections[peerId] = client;
-                        }
-                        if (_peerInfoMap.TryGetValue(peerId, out var existing) && existing.Hostname == "Unknown")
-                        {
-                            _peerInfoMap[peerId] = existing with
-                            {
-                                Hostname = packet.Hostname ?? existing.Hostname,
-                                IpAddress = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString(),
-                                TcpPort = packet.TcpPort > 0 ? packet.TcpPort : existing.TcpPort
-                            };
-                        }
-                        else if (!_peerInfoMap.ContainsKey(peerId))
-                        {
-                            _peerInfoMap[peerId] = new PeerInfo
-                            {
-                                PeerId = peerId,
-                                Hostname = packet.Hostname ?? "Unknown",
-                                IpAddress = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString(),
-                                TcpPort = packet.TcpPort > 0 ? packet.TcpPort : 51235,
-                                LastSeen = DateTime.UtcNow
-                            };
                         }
                         continue;
                     }
@@ -435,6 +412,25 @@ public sealed class TcpTransfer : IDisposable
         Hostname = _localHostname,
         TcpPort = _tcpPort
     };
+
+    private PeerInfo CreatePeerInfo(ClipboardPacket packet, TcpClient client)
+    {
+        var remoteIp = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
+        return new PeerInfo
+        {
+            PeerId = packet.SenderId,
+            Hostname = packet.Hostname ?? "Unknown",
+            IpAddress = remoteIp,
+            TcpPort = packet.TcpPort > 0 ? packet.TcpPort : _tcpPort,
+            LastSeen = DateTime.UtcNow
+        };
+    }
+
+    private void TrackPeerSeen(PeerInfo peer)
+    {
+        _peerInfoMap[peer.PeerId] = peer;
+        PeerSeen?.Invoke(this, peer);
+    }
 
     private byte[] EncodeSecureFrame(ClipboardPacket packet)
     {
