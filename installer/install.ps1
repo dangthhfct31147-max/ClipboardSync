@@ -56,8 +56,12 @@ function Get-ConfigToken {
 function Remove-Startup {
     $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existingTask) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-        Write-Host "  Scheduled task removed." -ForegroundColor Cyan
+        try {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+            Write-Host "  Scheduled task removed." -ForegroundColor Cyan
+        } catch {
+            Write-Host "  Could not remove existing scheduled task: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 
     if (Test-Path $startupShortcut) {
@@ -98,7 +102,8 @@ function Register-Startup {
             -Trigger $trigger `
             -Principal $principal `
             -Settings $settings `
-            -Description $description | Out-Null
+            -Description $description `
+            -ErrorAction Stop | Out-Null
         Write-Host "  Startup task registered for the current user." -ForegroundColor Gray
         return
     } catch {

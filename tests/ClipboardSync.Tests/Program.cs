@@ -1,16 +1,23 @@
 using System.Text;
+using System.Text.Json;
 using System.Security.Cryptography;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using ClipboardSync.Core;
+using ClipboardSync;
+using ClipboardSync.Utils;
 
-var tests = new (string Name, Action Body)[]
+var tests = new (string Name, Func<Task> Body)[]
 {
-    ("Discovery group id is stable and does not reveal the token", DiscoveryGroupIdIsStable),
-    ("Proof verifies only for the matching token and peer", ProofRequiresMatchingTokenAndPeer),
-    ("Encryption round-trips and rejects tampering", EncryptionRoundTripsAndRejectsTampering),
-    ("Discovery ignores VPN and virtual adapters", DiscoveryIgnoresVpnAndVirtualAdapters),
-    ("Discovery identifies local self addresses", DiscoveryIdentifiesLocalSelfAddresses)
+    ("Discovery group id is stable and does not reveal the token", RunSync(DiscoveryGroupIdIsStable)),
+    ("Proof verifies only for the matching token and peer", RunSync(ProofRequiresMatchingTokenAndPeer)),
+    ("Encryption round-trips and rejects tampering", RunSync(EncryptionRoundTripsAndRejectsTampering)),
+    ("Discovery ignores VPN and virtual adapters", RunSync(DiscoveryIgnoresVpnAndVirtualAdapters)),
+    ("Discovery identifies local self addresses", RunSync(DiscoveryIdentifiesLocalSelfAddresses)),
+    ("Single instance guard blocks a second running instance", SingleInstanceGuardBlocksSecondRunningInstance),
+    ("Outgoing TCP connection sends an initial heartbeat frame", OutgoingTcpConnectionSendsInitialHeartbeatFrame),
+    ("Inbound TCP connection stays open past the default heartbeat interval", InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval)
 };
 
 var failed = 0;
@@ -18,7 +25,7 @@ foreach (var test in tests)
 {
     try
     {
-        test.Body();
+        await test.Body();
         Console.WriteLine($"PASS {test.Name}");
     }
     catch (Exception ex)
@@ -32,6 +39,12 @@ if (failed > 0)
 {
     Environment.ExitCode = 1;
 }
+
+Func<Task> RunSync(Action action) => () =>
+{
+    action();
+    return Task.CompletedTask;
+};
 
 void DiscoveryGroupIdIsStable()
 {
@@ -91,6 +104,177 @@ void DiscoveryIdentifiesLocalSelfAddresses()
 
     AssertTrue(PeerDiscovery.IsLocalAddress("192.168.2.53", local), "known local address should be treated as self");
     AssertFalse(PeerDiscovery.IsLocalAddress("192.168.2.100", local), "remote LAN address should not be treated as self");
+}
+
+async Task SingleInstanceGuardBlocksSecondRunningInstance()
+{
+    var mutexName = $"Local\\ClipboardSync.Tests.{Guid.NewGuid():N}";
+    using (var first = SingleInstanceGuard.TryAcquire(mutexName))
+    {
+        AssertTrue(first.HasHandle, "first instance should acquire the mutex");
+        var secondHasHandle = await Task.Run(() =>
+        {
+            using var second = SingleInstanceGuard.TryAcquire(mutexName);
+            return second.HasHandle;
+        });
+        AssertFalse(secondHasHandle, "second instance should not acquire the same mutex");
+    }
+
+    using var third = SingleInstanceGuard.TryAcquire(mutexName);
+    AssertTrue(third.HasHandle, "mutex should be available again after the first instance exits");
+}
+
+async Task OutgoingTcpConnectionSendsInitialHeartbeatFrame()
+{
+    const string token = "secret-token-for-two-windows-machines";
+    var remoteListener = new TcpListener(IPAddress.Loopback, 0);
+    var localListener = new TcpListener(IPAddress.Loopback, 0);
+    remoteListener.Start();
+    localListener.Start();
+    var remotePort = ((IPEndPoint)remoteListener.LocalEndpoint).Port;
+    var localPort = ((IPEndPoint)localListener.LocalEndpoint).Port;
+    localListener.Stop();
+
+    var config = new AppConfig
+    {
+        Discovery = new DiscoveryConfig
+        {
+            UdpPort = 0,
+            BroadcastIntervalSeconds = 5,
+            PeerTimeoutSeconds = 30
+        },
+        Transfer = new TransferConfig { TcpPort = localPort },
+        Auth = new AuthConfig { Token = token }
+    };
+
+    var logPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
+    var logger = new FileLogger(logPath);
+    using var discovery = new PeerDiscovery(config, logger);
+    using var transfer = new TcpTransfer(config, logger, discovery);
+
+    await transfer.StartAsync();
+    try
+    {
+        transfer.RegisterPeer(new PeerInfo
+        {
+            PeerId = "remote-peer",
+            Hostname = "remote",
+            IpAddress = IPAddress.Loopback.ToString(),
+            TcpPort = remotePort
+        });
+
+        using var serverClient = await AwaitWithTimeout(remoteListener.AcceptTcpClientAsync(), TimeSpan.FromSeconds(2));
+        var stream = serverClient.GetStream();
+        var lenBytes = await ReadExactlyForTestAsync(stream, 4, TimeSpan.FromSeconds(2));
+        var frameLength = BitConverter.ToInt32(lenBytes, 0);
+        AssertTrue(frameLength > 0, "initial heartbeat frame should have a positive length");
+
+        var frameBytes = await ReadExactlyForTestAsync(stream, frameLength, TimeSpan.FromSeconds(2));
+        var frame = JsonSerializer.Deserialize<SecureFrame>(Encoding.UTF8.GetString(frameBytes));
+        AssertEqual("heartbeat", frame?.Type, "initial frame should be a heartbeat");
+        AssertTrue(SharedSecretAuth.VerifyProof(token, frame!.SenderId, frame.Timestamp, frame.Proof, TimeSpan.FromMinutes(2)), "initial heartbeat proof should verify");
+    }
+    finally
+    {
+        remoteListener.Stop();
+        if (File.Exists(logPath)) File.Delete(logPath);
+    }
+}
+
+async Task InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval()
+{
+    const string token = "secret-token-for-two-windows-machines";
+    var localListener = new TcpListener(IPAddress.Loopback, 0);
+    localListener.Start();
+    var localPort = ((IPEndPoint)localListener.LocalEndpoint).Port;
+    localListener.Stop();
+
+    var config = new AppConfig
+    {
+        Discovery = new DiscoveryConfig
+        {
+            UdpPort = 0,
+            BroadcastIntervalSeconds = 5,
+            PeerTimeoutSeconds = 30
+        },
+        Transfer = new TransferConfig { TcpPort = localPort },
+        Auth = new AuthConfig { Token = token }
+    };
+
+    var logPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
+    var logger = new FileLogger(logPath);
+    using var discovery = new PeerDiscovery(config, logger);
+    using var transfer = new TcpTransfer(config, logger, discovery);
+    using var client = new TcpClient();
+
+    await transfer.StartAsync();
+    try
+    {
+        await client.ConnectAsync(IPAddress.Loopback, localPort);
+        await WriteHeartbeatFrameForTestAsync(client.GetStream(), token, "remote-peer", 51235);
+        await Task.Delay(TimeSpan.FromSeconds(11));
+
+        var log = File.Exists(logPath) ? await File.ReadAllTextAsync(logPath) : "";
+        AssertFalse(log.Contains("Connection to peer remote-peer closed.", StringComparison.Ordinal), "inbound connection should remain open while waiting for the next heartbeat");
+    }
+    finally
+    {
+        if (File.Exists(logPath)) File.Delete(logPath);
+    }
+}
+
+async Task WriteHeartbeatFrameForTestAsync(NetworkStream stream, string token, string senderId, int tcpPort)
+{
+    var packet = new ClipboardPacket
+    {
+        Type = "heartbeat",
+        Hash = "",
+        Format = ClipboardFormat.Text,
+        Size = 0,
+        SenderId = senderId,
+        Hostname = "remote",
+        TcpPort = tcpPort
+    };
+    var plaintext = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
+    var encrypted = SharedSecretAuth.Encrypt(token, plaintext);
+    var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    var frame = new SecureFrame
+    {
+        Type = packet.Type,
+        SenderId = packet.SenderId,
+        Timestamp = timestamp,
+        Proof = SharedSecretAuth.CreateProof(token, packet.SenderId, timestamp),
+        Nonce = encrypted.Nonce,
+        Ciphertext = encrypted.Ciphertext,
+        Tag = encrypted.Tag
+    };
+    var frameBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(frame));
+    await stream.WriteAsync(BitConverter.GetBytes(frameBytes.Length));
+    await stream.WriteAsync(frameBytes);
+    await stream.FlushAsync();
+}
+
+async Task<T> AwaitWithTimeout<T>(Task<T> task, TimeSpan timeout)
+{
+    var completed = await Task.WhenAny(task, Task.Delay(timeout));
+    if (completed != task)
+        throw new TimeoutException($"Timed out after {timeout.TotalMilliseconds}ms.");
+
+    return await task;
+}
+
+async Task<byte[]> ReadExactlyForTestAsync(NetworkStream stream, int count, TimeSpan timeout)
+{
+    var buffer = new byte[count];
+    using var cts = new CancellationTokenSource(timeout);
+    var offset = 0;
+    while (offset < count)
+    {
+        var read = await stream.ReadAsync(buffer.AsMemory(offset, count - offset), cts.Token);
+        if (read == 0) throw new EndOfStreamException();
+        offset += read;
+    }
+    return buffer;
 }
 
 void AssertTrue(bool condition, string message)

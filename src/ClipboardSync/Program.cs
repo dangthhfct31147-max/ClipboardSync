@@ -7,6 +7,17 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
+using var instanceGuard = SingleInstanceGuard.TryAcquire();
+if (!instanceGuard.HasHandle)
+{
+    MessageBox.Show(
+        "ClipboardSync is already running.",
+        "ClipboardSync",
+        MessageBoxButtons.OK,
+        MessageBoxIcon.Information);
+    return;
+}
+
 // Resolve log dir and logger first — before any DI
 var appDataDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

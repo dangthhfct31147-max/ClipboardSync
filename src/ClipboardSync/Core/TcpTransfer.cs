@@ -18,6 +18,7 @@ public sealed class TcpTransfer : IDisposable
     private readonly ConcurrentDictionary<string, TcpClient> _connections = new();
     private readonly ConcurrentDictionary<string, PeerInfo> _peerInfoMap = new();
     private readonly int _peerTimeoutSeconds;
+    private readonly int _readIdleTimeoutMs;
     private CancellationTokenSource? _heartbeatCts;
     private CancellationTokenSource? _connectionCts;
     private readonly object _connLock = new();
@@ -28,7 +29,7 @@ public sealed class TcpTransfer : IDisposable
     private const int MaxClipboardBytes = 50 * 1024 * 1024;
     private const int MaxSecureFrameBytes = 75 * 1024 * 1024;
     private const int SendTimeoutMs = 5000;
-    private const int ReceiveTimeoutMs = 10000;
+    private const int MinimumReadIdleTimeoutMs = 10000;
     private const int MaxReconnectAttempts = 3;
     private const int MaxReconnectDelayMs = 30000;
 
@@ -39,6 +40,7 @@ public sealed class TcpTransfer : IDisposable
         _logger = logger;
         _tcpPort = config.Transfer.TcpPort;
         _peerTimeoutSeconds = config.Discovery.PeerTimeoutSeconds;
+        _readIdleTimeoutMs = Math.Max(MinimumReadIdleTimeoutMs, _peerTimeoutSeconds * 1000);
         _authToken = config.Auth.RequireToken();
         _localHostname = discovery.LocalHostname;
         _localPeerId = discovery.LocalPeerId;
@@ -92,10 +94,12 @@ public sealed class TcpTransfer : IDisposable
             {
                 var client = new TcpClient();
                 client.SendTimeout = SendTimeoutMs;
-                client.ReceiveTimeout = ReceiveTimeoutMs;
+                client.ReceiveTimeout = _readIdleTimeoutMs;
 
                 using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                 await client.ConnectAsync(peer.IpAddress, peer.TcpPort, connectCts.Token);
+                client.NoDelay = true;
+                await SendInitialHeartbeatAsync(client);
 
                 if (_connections.TryAdd(peer.PeerId, client))
                 {
@@ -121,6 +125,17 @@ public sealed class TcpTransfer : IDisposable
         _logger.Warn($"Failed to connect to peer {peer.Hostname} after {maxAttempts} attempts");
     }
 
+    private async Task SendInitialHeartbeatAsync(TcpClient client)
+    {
+        var packet = CreateHeartbeatPacket();
+        var headerBytes = EncodeSecureFrame(packet);
+        var lenBytes = BitConverter.GetBytes(headerBytes.Length);
+        var stream = client.GetStream();
+        await stream.WriteAsync(lenBytes);
+        await stream.WriteAsync(headerBytes);
+        await stream.FlushAsync();
+    }
+
     private async Task AcceptLoop(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -129,7 +144,7 @@ public sealed class TcpTransfer : IDisposable
             {
                 var client = await _listener!.AcceptTcpClientAsync(ct);
                 client.SendTimeout = SendTimeoutMs;
-                client.ReceiveTimeout = ReceiveTimeoutMs;
+                client.ReceiveTimeout = _readIdleTimeoutMs;
                 client.NoDelay = true;
                 _ = HandleIncomingConnection(client, ct);
             }
@@ -155,7 +170,7 @@ public sealed class TcpTransfer : IDisposable
                 return;
             }
 
-            var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct, 10000);
+            var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct, _readIdleTimeoutMs);
             var packet = DecodeSecureFrame(jsonBytes);
             if (packet == null) return;
 
@@ -231,7 +246,7 @@ public sealed class TcpTransfer : IDisposable
                         break;
                     }
 
-                    var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct, 10000);
+                    var jsonBytes = await ReadExactlyAsync(stream, headerLen, ct, _readIdleTimeoutMs);
                     var packet = DecodeSecureFrame(jsonBytes);
                     if (packet == null) break;
                     if (packet.SenderId != peerId)
@@ -336,16 +351,7 @@ public sealed class TcpTransfer : IDisposable
             {
                 await Task.Delay(TimeSpan.FromSeconds(_peerTimeoutSeconds / 2.0), ct);
 
-                var packet = new ClipboardPacket
-                {
-                    Type = "heartbeat",
-                    Hash = "",
-                    Format = ClipboardFormat.Text,
-                    Size = 0,
-                    SenderId = _localPeerId,
-                    Hostname = _localHostname,
-                    TcpPort = _tcpPort
-                };
+                var packet = CreateHeartbeatPacket();
                 var headerBytes = EncodeSecureFrame(packet);
                 var lenBytes = BitConverter.GetBytes(headerBytes.Length);
 
@@ -419,6 +425,17 @@ public sealed class TcpTransfer : IDisposable
         }
     }
 
+    private ClipboardPacket CreateHeartbeatPacket() => new()
+    {
+        Type = "heartbeat",
+        Hash = "",
+        Format = ClipboardFormat.Text,
+        Size = 0,
+        SenderId = _localPeerId,
+        Hostname = _localHostname,
+        TcpPort = _tcpPort
+    };
+
     private byte[] EncodeSecureFrame(ClipboardPacket packet)
     {
         var plaintext = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(packet));
@@ -491,9 +508,9 @@ public sealed class TcpTransfer : IDisposable
         }
     }
 
-    private static async Task<int> ReadInt32Async(NetworkStream stream, CancellationToken ct)
+    private async Task<int> ReadInt32Async(NetworkStream stream, CancellationToken ct)
     {
-        var buf = await ReadExactlyAsync(stream, 4, ct, timeoutMs: 10000);
+        var buf = await ReadExactlyAsync(stream, 4, ct, _readIdleTimeoutMs);
         return BitConverter.ToInt32(buf, 0);
     }
 

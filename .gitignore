@@ -9,6 +9,8 @@ src/ClipboardSync/bin/
 src/ClipboardSync/obj/
 *.dll
 *.exe
+*.deps.json
+*.runtimeconfig.json
 *.pdb
 *.user
 *.suo
@@ -20,6 +22,8 @@ src/ClipboardSync/obj/
 publish/
 out/
 installer/staged/
+installer/data/
+installer/logs/
 
 # IDE
 .vs/
