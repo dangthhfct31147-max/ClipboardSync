@@ -133,6 +133,7 @@ public sealed class ClipboardSyncHostedService : IHostedService, IDisposable
         _logger.Info("Network changed, triggering peer re-discovery...");
         _peerManager.ClearAndRediscover();
         _trayIcon.UpdateStatus(GetStatusText());
+        _trayIcon.UpdatePeerList(_peerManager.GetPeers());
     }
 
     private void OnClipboardReceived(object? sender, ClipboardReceivedEventArgs e)

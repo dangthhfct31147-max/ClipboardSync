@@ -4,6 +4,8 @@ using System.Security.Cryptography;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Drawing;
+using ClipboardSync.Tray;
 using ClipboardSync.Core;
 using ClipboardSync;
 using ClipboardSync.Utils;
@@ -16,6 +18,7 @@ var tests = new (string Name, Func<Task> Body)[]
     ("Discovery ignores VPN and virtual adapters", RunSync(DiscoveryIgnoresVpnAndVirtualAdapters)),
     ("Discovery identifies local self addresses", RunSync(DiscoveryIdentifiesLocalSelfAddresses)),
     ("Single instance guard blocks a second running instance", SingleInstanceGuardBlocksSecondRunningInstance),
+    ("Tray icon color reflects peer connection state", RunSync(TrayIconColorReflectsPeerConnectionState)),
     ("Outgoing TCP connection sends an initial heartbeat frame", OutgoingTcpConnectionSendsInitialHeartbeatFrame),
     ("Inbound TCP connection stays open past the default heartbeat interval", InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval)
 };
@@ -104,6 +107,13 @@ void DiscoveryIdentifiesLocalSelfAddresses()
 
     AssertTrue(PeerDiscovery.IsLocalAddress("192.168.2.53", local), "known local address should be treated as self");
     AssertFalse(PeerDiscovery.IsLocalAddress("192.168.2.100", local), "remote LAN address should not be treated as self");
+}
+
+void TrayIconColorReflectsPeerConnectionState()
+{
+    AssertEqual(Color.FromArgb(30, 64, 175), TrayIconManager.GetIconBackColorForPeerCount(0), "tray icon should be blue before peers connect");
+    AssertEqual(Color.FromArgb(22, 163, 74), TrayIconManager.GetIconBackColorForPeerCount(1), "tray icon should turn green after a peer connects");
+    AssertEqual(Color.FromArgb(22, 163, 74), TrayIconManager.GetIconBackColorForPeerCount(2), "tray icon should stay green while any peer is connected");
 }
 
 async Task SingleInstanceGuardBlocksSecondRunningInstance()
