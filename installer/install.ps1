@@ -173,7 +173,7 @@ if (-not (Test-Path $configPath)) {
 $configuredToken = Get-ConfigToken
 $generatedToken = $false
 if ($PSBoundParameters.ContainsKey("Token") -and [string]::IsNullOrWhiteSpace($Token)) {
-    throw 'Token cannot be empty. On the first machine run .\install.ps1, then copy the printed -Token value to the second machine.'
+    throw 'Token cannot be empty. On the first machine run .\setup.ps1 -Machine 1, then copy the printed token command to the second machine.'
 }
 
 if ([string]::IsNullOrWhiteSpace($Token)) {
@@ -210,6 +210,6 @@ Write-Host "  Uninstall: .\install.ps1 -Uninstall" -ForegroundColor Gray
 if ($generatedToken) {
     Write-Host ""
     Write-Host "Pair another Windows machine with this command:" -ForegroundColor Yellow
-    Write-Host "  .\install.ps1 -Token `"$Token`"" -ForegroundColor White
+    Write-Host "  .\setup.ps1 -Machine 2 -Token `"$Token`"" -ForegroundColor White
     Write-Host "Keep this token private. Anyone with it can join this clipboard sync group." -ForegroundColor Yellow
 }

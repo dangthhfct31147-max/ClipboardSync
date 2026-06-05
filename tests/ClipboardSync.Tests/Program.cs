@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Drawing;
+using System.Windows.Forms;
 using ClipboardSync.Tray;
 using ClipboardSync.Core;
 using ClipboardSync;
@@ -21,6 +22,7 @@ var tests = new (string Name, Func<Task> Body)[]
     ("Single instance guard blocks a second running instance", SingleInstanceGuardBlocksSecondRunningInstance),
     ("Tray icon color reflects peer connection state", RunSync(TrayIconColorReflectsPeerConnectionState)),
     ("Remote clipboard update can be applied from a background thread", RemoteClipboardUpdateCanBeAppliedFromBackgroundThread),
+    ("Rapid screenshot image updates are coalesced into one event", RapidScreenshotImageUpdatesAreCoalescedIntoOneEvent),
     ("Outgoing TCP connection sends an initial heartbeat frame", OutgoingTcpConnectionSendsInitialHeartbeatFrame),
     ("TCP heartbeat reports peer liveness", TcpHeartbeatReportsPeerLiveness),
     ("Inbound TCP connection stays open past the default heartbeat interval", InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval)
@@ -188,6 +190,39 @@ async Task RemoteClipboardUpdateCanBeAppliedFromBackgroundThread()
     AssertFalse(string.IsNullOrWhiteSpace(monitor.LastHash), "background clipboard update should update LastHash");
 }
 
+async Task RapidScreenshotImageUpdatesAreCoalescedIntoOneEvent()
+{
+    var config = CreateTestConfig(tcpPort: 51235);
+    var logPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
+    var logger = new FileLogger(logPath);
+    using var monitor = new ClipboardMonitor(config, logger);
+    var imageEvents = 0;
+    var firstEvent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    monitor.ClipboardChanged += (_, e) =>
+    {
+        if (e.Format != ClipboardFormat.Image) return;
+        Interlocked.Increment(ref imageEvents);
+        firstEvent.TrySetResult();
+    };
+
+    monitor.Start();
+    await Task.Delay(500);
+
+    await RunStaAsync(() =>
+    {
+        using var first = CreateTestBitmap(Color.Red);
+        Clipboard.SetImage(first);
+        Thread.Sleep(250);
+        using var second = CreateTestBitmap(Color.Green);
+        Clipboard.SetImage(second);
+    });
+
+    await AwaitTaskWithTimeout(firstEvent.Task, TimeSpan.FromSeconds(5));
+    await Task.Delay(TimeSpan.FromSeconds(1));
+    AssertEqual(1, imageEvents, "rapid screenshot image clipboard updates should emit one image event");
+}
+
 async Task OutgoingTcpConnectionSendsInitialHeartbeatFrame()
 {
     const string token = "secret-token-for-two-windows-machines";
@@ -345,6 +380,34 @@ async Task AwaitTaskWithTimeout(Task task, TimeSpan timeout)
         throw new TimeoutException($"Timed out after {timeout.TotalMilliseconds}ms.");
 
     await task;
+}
+
+Task RunStaAsync(Action action)
+{
+    var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            action();
+            tcs.SetResult();
+        }
+        catch (Exception ex)
+        {
+            tcs.SetException(ex);
+        }
+    });
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    return tcs.Task;
+}
+
+Bitmap CreateTestBitmap(Color color)
+{
+    var bmp = new Bitmap(16, 16);
+    using var g = Graphics.FromImage(bmp);
+    g.Clear(color);
+    return bmp;
 }
 
 async Task<byte[]> ReadExactlyForTestAsync(NetworkStream stream, int count, TimeSpan timeout)

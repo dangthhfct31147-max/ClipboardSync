@@ -26,9 +26,12 @@ public sealed class ClipboardMonitor : IDisposable
     private readonly ManualResetEventSlim _clipboardReady = new(false);
     private readonly object _hashLock = new();
     private readonly object _debounceLock = new();
+    private readonly object _pendingImageLock = new();
+    private CancellationTokenSource? _pendingImageCts;
     private DateTime _lastChangeTime = DateTime.MinValue;
     private string _debounceHash = string.Empty;
     private const int DebounceMs = 150;
+    private const int ImageSettleDelayMs = 750;
 
     public event EventHandler<ClipboardChangedEventArgs>? ClipboardChanged;
 
@@ -143,27 +146,79 @@ public sealed class ClipboardMonitor : IDisposable
                 return;
             }
 
-            lock (_hashLock)
-            {
-                if (hash == _lastHash) return;
-                _lastHash = hash;
-            }
-
-            lock (_debounceLock)
-            {
-                var now = DateTime.UtcNow;
-                if (hash == _debounceHash && (now - _lastChangeTime).TotalMilliseconds < DebounceMs) return;
-                _debounceHash = hash;
-                _lastChangeTime = now;
-            }
-
             var args = new ClipboardChangedEventArgs(hash, format, textContent, imageData, filePaths);
-            ClipboardChanged?.Invoke(this, args);
+            if (format == ClipboardFormat.Image)
+            {
+                ScheduleImageChanged(hash, args);
+                return;
+            }
+
+            PublishClipboardChanged(hash, args);
         }
         catch (Exception ex)
         {
             _logger.Error("Error reading clipboard", ex);
         }
+    }
+
+    private void ScheduleImageChanged(string hash, ClipboardChangedEventArgs args)
+    {
+        CancellationTokenSource cts;
+        lock (_pendingImageLock)
+        {
+            _pendingImageCts?.Cancel();
+            _pendingImageCts?.Dispose();
+            _pendingImageCts = new CancellationTokenSource();
+            cts = _pendingImageCts;
+        }
+
+        _ = PublishImageAfterSettleAsync(hash, args, cts.Token);
+    }
+
+    private async Task PublishImageAfterSettleAsync(string hash, ClipboardChangedEventArgs args, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(ImageSettleDelayMs, ct);
+            if (ct.IsCancellationRequested || _disposed) return;
+
+            var form = _clipboardForm;
+            if (form != null && form.IsHandleCreated && !form.IsDisposed)
+            {
+                form.BeginInvoke(new Action(() =>
+                {
+                    if (!ct.IsCancellationRequested && !_disposed)
+                    {
+                        PublishClipboardChanged(hash, args);
+                    }
+                }));
+                return;
+            }
+
+            PublishClipboardChanged(hash, args);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private void PublishClipboardChanged(string hash, ClipboardChangedEventArgs args)
+    {
+        lock (_hashLock)
+        {
+            if (hash == _lastHash) return;
+            _lastHash = hash;
+        }
+
+        lock (_debounceLock)
+        {
+            var now = DateTime.UtcNow;
+            if (hash == _debounceHash && (now - _lastChangeTime).TotalMilliseconds < DebounceMs) return;
+            _debounceHash = hash;
+            _lastChangeTime = now;
+        }
+
+        ClipboardChanged?.Invoke(this, args);
     }
 
     public void UpdateClipboardSilently(string? text, byte[]? image, List<string>? files)
@@ -241,6 +296,12 @@ public sealed class ClipboardMonitor : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        lock (_pendingImageLock)
+        {
+            _pendingImageCts?.Cancel();
+            _pendingImageCts?.Dispose();
+            _pendingImageCts = null;
+        }
         Stop();
         _clipboardReady.Dispose();
     }
