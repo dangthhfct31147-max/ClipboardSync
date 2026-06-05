@@ -20,6 +20,7 @@ var tests = new (string Name, Func<Task> Body)[]
     ("Peer manager can refresh a peer from TCP liveness", RunSync(PeerManagerCanRefreshPeerFromTcpLiveness)),
     ("Single instance guard blocks a second running instance", SingleInstanceGuardBlocksSecondRunningInstance),
     ("Tray icon color reflects peer connection state", RunSync(TrayIconColorReflectsPeerConnectionState)),
+    ("Remote clipboard update can be applied from a background thread", RemoteClipboardUpdateCanBeAppliedFromBackgroundThread),
     ("Outgoing TCP connection sends an initial heartbeat frame", OutgoingTcpConnectionSendsInitialHeartbeatFrame),
     ("TCP heartbeat reports peer liveness", TcpHeartbeatReportsPeerLiveness),
     ("Inbound TCP connection stays open past the default heartbeat interval", InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval)
@@ -162,6 +163,29 @@ async Task SingleInstanceGuardBlocksSecondRunningInstance()
 
     using var third = SingleInstanceGuard.TryAcquire(mutexName);
     AssertTrue(third.HasHandle, "mutex should be available again after the first instance exits");
+}
+
+async Task RemoteClipboardUpdateCanBeAppliedFromBackgroundThread()
+{
+    var config = CreateTestConfig(tcpPort: 51235);
+    var logPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
+    var logger = new FileLogger(logPath);
+    using var monitor = new ClipboardMonitor(config, logger);
+    var text = $"ClipboardSync background update {Guid.NewGuid():N}";
+
+    monitor.Start();
+    await Task.Delay(500);
+
+    var apartment = ApartmentState.Unknown;
+    var updateTask = Task.Run(() =>
+    {
+        apartment = Thread.CurrentThread.GetApartmentState();
+        monitor.UpdateClipboardSilently(text, image: null, files: null);
+    });
+
+    await AwaitTaskWithTimeout(updateTask, TimeSpan.FromSeconds(5));
+    AssertFalse(apartment == ApartmentState.STA, "test should call UpdateClipboardSilently from a non-STA worker thread");
+    AssertFalse(string.IsNullOrWhiteSpace(monitor.LastHash), "background clipboard update should update LastHash");
 }
 
 async Task OutgoingTcpConnectionSendsInitialHeartbeatFrame()
@@ -312,6 +336,15 @@ async Task<T> AwaitWithTimeout<T>(Task<T> task, TimeSpan timeout)
         throw new TimeoutException($"Timed out after {timeout.TotalMilliseconds}ms.");
 
     return await task;
+}
+
+async Task AwaitTaskWithTimeout(Task task, TimeSpan timeout)
+{
+    var completed = await Task.WhenAny(task, Task.Delay(timeout));
+    if (completed != task)
+        throw new TimeoutException($"Timed out after {timeout.TotalMilliseconds}ms.");
+
+    await task;
 }
 
 async Task<byte[]> ReadExactlyForTestAsync(NetworkStream stream, int count, TimeSpan timeout)
