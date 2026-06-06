@@ -37,14 +37,19 @@ public sealed class TcpTransfer : IDisposable
     public event EventHandler<PeerInfo>? PeerSeen;
 
     public TcpTransfer(AppConfig config, FileLogger logger, PeerDiscovery discovery)
+        : this(config, logger, discovery.LocalHostname, discovery.LocalPeerId)
+    {
+    }
+
+    internal TcpTransfer(AppConfig config, FileLogger logger, string localHostname, string localPeerId)
     {
         _logger = logger;
         _tcpPort = config.Transfer.TcpPort;
         _peerTimeoutSeconds = config.Discovery.PeerTimeoutSeconds;
         _readIdleTimeoutMs = Math.Max(MinimumReadIdleTimeoutMs, _peerTimeoutSeconds * 1000);
         _authToken = config.Auth.RequireToken();
-        _localHostname = discovery.LocalHostname;
-        _localPeerId = discovery.LocalPeerId;
+        _localHostname = localHostname;
+        _localPeerId = localPeerId;
     }
 
     public Task StartAsync()
@@ -77,12 +82,26 @@ public sealed class TcpTransfer : IDisposable
         ClosePeerConnection(peerId);
     }
 
-    private void ClosePeerConnection(string peerId)
+    private void ClosePeerConnection(string peerId, TcpClient? expectedClient = null)
     {
-        if (_connections.TryRemove(peerId, out var client))
+        if (expectedClient == null)
         {
-            try { client.Close(); } catch { }
+            if (_connections.TryRemove(peerId, out var client))
+            {
+                try { client.Close(); } catch { }
+            }
+            return;
         }
+
+        if (_connections.TryGetValue(peerId, out var current) &&
+            ReferenceEquals(current, expectedClient) &&
+            _connections.TryRemove(peerId, out var removed))
+        {
+            try { removed.Close(); } catch { }
+            return;
+        }
+
+        try { expectedClient.Close(); } catch { }
     }
 
     private async Task ConnectToPeerWithReconnectAsync(PeerInfo peer, int maxAttempts = 3)
@@ -161,6 +180,7 @@ public sealed class TcpTransfer : IDisposable
     private async Task HandleIncomingConnection(TcpClient client, CancellationToken ct)
     {
         string? peerId = null;
+        var trackedByReceiveLoop = false;
         try
         {
             var stream = client.GetStream();
@@ -180,16 +200,18 @@ public sealed class TcpTransfer : IDisposable
                 peerId = packet.SenderId;
                 var peer = CreatePeerInfo(packet, client);
                 TrackPeerSeen(peer);
-                if (_connections.TryAdd(peerId, client))
+                if (TryTrackIncomingConnection(peerId, client))
                 {
                     _logger.Debug($"Incoming connection from {peerId} accepted.");
                     _ = ReceiveLoop(peerId, client, _connectionCts!.Token);
+                    trackedByReceiveLoop = true;
                 }
                 return;
             }
 
             if (packet.Type == "clipboard")
             {
+                peerId = packet.SenderId;
                 if (packet.Size > MaxClipboardBytes ||
                     (packet.ImageData?.Length ?? 0) > MaxClipboardBytes)
                 {
@@ -222,6 +244,16 @@ public sealed class TcpTransfer : IDisposable
         {
             if (!_disposed)
                 _logger.Warn($"Handle incoming connection error: {ex.Message}");
+        }
+        finally
+        {
+            if (!trackedByReceiveLoop)
+            {
+                if (peerId != null)
+                    ClosePeerConnection(peerId, client);
+                else
+                    try { client.Close(); } catch { }
+            }
         }
     }
 
@@ -305,7 +337,7 @@ public sealed class TcpTransfer : IDisposable
         }
         finally
         {
-            ClosePeerConnection(peerId);
+            ClosePeerConnection(peerId, client);
             _logger.Info($"Connection to peer {peerId} closed.");
 
             if (_peerInfoMap.TryGetValue(peerId, out var peer) && !_disposed)
@@ -332,7 +364,7 @@ public sealed class TcpTransfer : IDisposable
                 var headerBytes = EncodeSecureFrame(packet);
                 var lenBytes = BitConverter.GetBytes(headerBytes.Length);
 
-                List<string> deadConnections = [];
+                List<(string PeerId, TcpClient Client)> deadConnections = [];
 
                 foreach (var (peerId, client) in _connections)
                 {
@@ -345,12 +377,12 @@ public sealed class TcpTransfer : IDisposable
                     }
                     catch
                     {
-                        deadConnections.Add(peerId);
+                        deadConnections.Add((peerId, client));
                     }
                 }
 
-                foreach (var deadId in deadConnections)
-                    ClosePeerConnection(deadId);
+                foreach (var (deadId, deadClient) in deadConnections)
+                    ClosePeerConnection(deadId, deadClient);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
@@ -398,9 +430,38 @@ public sealed class TcpTransfer : IDisposable
         }
         catch (Exception)
         {
-            // Connection will be cleaned up by heartbeat
+            ClosePeerConnection(peerId, client);
         }
     }
+
+    private bool TryTrackIncomingConnection(string peerId, TcpClient client)
+    {
+        lock (_connLock)
+        {
+            if (!_connections.TryGetValue(peerId, out var existing))
+            {
+                return _connections.TryAdd(peerId, client);
+            }
+
+            if (ReferenceEquals(existing, client))
+            {
+                return true;
+            }
+
+            if (!ShouldPreferIncomingConnection(_localPeerId, peerId))
+            {
+                try { client.Close(); } catch { }
+                return false;
+            }
+
+            _connections[peerId] = client;
+            try { existing.Close(); } catch { }
+            return true;
+        }
+    }
+
+    internal static bool ShouldPreferIncomingConnection(string localPeerId, string remotePeerId) =>
+        string.CompareOrdinal(localPeerId, remotePeerId) > 0;
 
     private ClipboardPacket CreateHeartbeatPacket() => new()
     {

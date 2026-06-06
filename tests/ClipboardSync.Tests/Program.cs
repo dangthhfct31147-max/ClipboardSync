@@ -25,7 +25,8 @@ var tests = new (string Name, Func<Task> Body)[]
     ("Rapid screenshot image updates are coalesced into one event", RapidScreenshotImageUpdatesAreCoalescedIntoOneEvent),
     ("Outgoing TCP connection sends an initial heartbeat frame", OutgoingTcpConnectionSendsInitialHeartbeatFrame),
     ("TCP heartbeat reports peer liveness", TcpHeartbeatReportsPeerLiveness),
-    ("Inbound TCP connection stays open past the default heartbeat interval", InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval)
+    ("Inbound TCP connection stays open past the default heartbeat interval", InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval),
+    ("Simultaneous TCP peer connections still deliver clipboard payloads", SimultaneousTcpPeerConnectionsStillDeliverClipboardPayloads)
 };
 
 var failed = 0;
@@ -319,6 +320,68 @@ async Task InboundTcpConnectionStaysOpenPastDefaultHeartbeatInterval()
 
     var log = File.Exists(logPath) ? await File.ReadAllTextAsync(logPath) : "";
     AssertFalse(log.Contains("Connection to peer remote-peer closed.", StringComparison.Ordinal), "inbound connection should remain open while waiting for the next heartbeat");
+}
+
+async Task SimultaneousTcpPeerConnectionsStillDeliverClipboardPayloads()
+{
+    var firstProbe = new TcpListener(IPAddress.Loopback, 0);
+    var secondProbe = new TcpListener(IPAddress.Loopback, 0);
+    firstProbe.Start();
+    secondProbe.Start();
+    var firstPort = ((IPEndPoint)firstProbe.LocalEndpoint).Port;
+    var secondPort = ((IPEndPoint)secondProbe.LocalEndpoint).Port;
+    firstProbe.Stop();
+    secondProbe.Stop();
+
+    var firstConfig = CreateTestConfig(firstPort);
+    var secondConfig = CreateTestConfig(secondPort);
+    var firstLogPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
+    var secondLogPath = Path.Combine(Path.GetTempPath(), $"clipboardsync-tests-{Guid.NewGuid():N}.log");
+    var firstLogger = new FileLogger(firstLogPath);
+    var secondLogger = new FileLogger(secondLogPath);
+    using var first = new TcpTransfer(firstConfig, firstLogger, "first", "peer-a");
+    using var second = new TcpTransfer(secondConfig, secondLogger, "second", "peer-b");
+    var received = new TaskCompletionSource<ClipboardReceivedEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
+    second.ClipboardReceived += (_, e) =>
+    {
+        if (e.SenderId == "peer-a")
+            received.TrySetResult(e);
+    };
+
+    await first.StartAsync();
+    await second.StartAsync();
+
+    first.RegisterPeer(new PeerInfo
+    {
+        PeerId = "peer-b",
+        Hostname = "second",
+        IpAddress = IPAddress.Loopback.ToString(),
+        TcpPort = secondPort
+    });
+    second.RegisterPeer(new PeerInfo
+    {
+        PeerId = "peer-a",
+        Hostname = "first",
+        IpAddress = IPAddress.Loopback.ToString(),
+        TcpPort = firstPort
+    });
+
+    await Task.Delay(TimeSpan.FromMilliseconds(500));
+
+    await first.SendClipboardAsync(new ClipboardPacket
+    {
+        Type = "clipboard",
+        Hash = "test-hash",
+        Format = ClipboardFormat.Text,
+        Size = Encoding.UTF8.GetByteCount("hello from first"),
+        TextContent = "hello from first",
+        SenderId = "peer-a",
+        Hostname = "first",
+        TcpPort = firstPort
+    });
+
+    var payload = await AwaitWithTimeout(received.Task, TimeSpan.FromSeconds(3));
+    AssertEqual("hello from first", payload.TextContent, "simultaneous peer connections should leave a readable channel for clipboard payloads");
 }
 
 AppConfig CreateTestConfig(int tcpPort) => new()

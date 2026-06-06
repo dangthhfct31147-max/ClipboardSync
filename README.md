@@ -156,6 +156,7 @@ If peers do not connect:
 - Install the latest copied `installer` folder on both machines. Running a new build on only one machine can leave the other machine on old sync logic.
 - If needed, run `install.ps1` as Administrator once to add the firewall rule.
 - Check logs under `%LOCALAPPDATA%\ClipboardSync\logs\`.
+- Run `.\diagnose.ps1` from the `installer` folder on both machines. The `TokenSha256Prefix` and `ExeSha256Prefix` values must match on both machines; the script does not print the raw token.
 
 If tray icons are green but clipboard content does not appear on the other machine:
 
