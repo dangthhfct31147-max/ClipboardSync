@@ -22,11 +22,16 @@ public sealed class ClipboardMonitor : IDisposable
     private readonly FileLogger _logger;
     private bool _disposed;
     private Thread? _clipboardThread;
+    private HiddenClipboardForm? _clipboardForm;
+    private readonly ManualResetEventSlim _clipboardReady = new(false);
     private readonly object _hashLock = new();
     private readonly object _debounceLock = new();
+    private readonly object _pendingImageLock = new();
+    private CancellationTokenSource? _pendingImageCts;
     private DateTime _lastChangeTime = DateTime.MinValue;
     private string _debounceHash = string.Empty;
     private const int DebounceMs = 150;
+    private const int ImageSettleDelayMs = 750;
 
     public event EventHandler<ClipboardChangedEventArgs>? ClipboardChanged;
 
@@ -50,8 +55,17 @@ public sealed class ClipboardMonitor : IDisposable
 
     private void ClipboardThreadMain()
     {
-        var form = new HiddenClipboardForm(this, _logger);
-        Application.Run(form);
+        using var form = new HiddenClipboardForm(this, _logger);
+        _clipboardForm = form;
+        _clipboardReady.Set();
+        try
+        {
+            Application.Run(form);
+        }
+        finally
+        {
+            _clipboardForm = null;
+        }
     }
 
     [DllImport("user32.dll")]
@@ -63,7 +77,16 @@ public sealed class ClipboardMonitor : IDisposable
 
         if (_clipboardThread != null && _clipboardThread.IsAlive)
         {
-            PostThreadMessage(_clipboardThread.ManagedThreadId, 0x0010, IntPtr.Zero, IntPtr.Zero);
+            var form = _clipboardForm;
+            if (form != null && form.IsHandleCreated && !form.IsDisposed)
+            {
+                try { form.BeginInvoke(new Action(form.Close)); } catch { }
+            }
+            else
+            {
+                PostThreadMessage(_clipboardThread.ManagedThreadId, HiddenClipboardForm.WM_QUIT_FORM, IntPtr.Zero, IntPtr.Zero);
+            }
+
             if (!_clipboardThread.Join(3000))
             {
                 _logger.Warn("Clipboard thread did not exit cleanly.");
@@ -123,22 +146,14 @@ public sealed class ClipboardMonitor : IDisposable
                 return;
             }
 
-            lock (_hashLock)
-            {
-                if (hash == _lastHash) return;
-                _lastHash = hash;
-            }
-
-            lock (_debounceLock)
-            {
-                var now = DateTime.UtcNow;
-                if (hash == _debounceHash && (now - _lastChangeTime).TotalMilliseconds < DebounceMs) return;
-                _debounceHash = hash;
-                _lastChangeTime = now;
-            }
-
             var args = new ClipboardChangedEventArgs(hash, format, textContent, imageData, filePaths);
-            ClipboardChanged?.Invoke(this, args);
+            if (format == ClipboardFormat.Image)
+            {
+                ScheduleImageChanged(hash, args);
+                return;
+            }
+
+            PublishClipboardChanged(hash, args);
         }
         catch (Exception ex)
         {
@@ -146,7 +161,91 @@ public sealed class ClipboardMonitor : IDisposable
         }
     }
 
+    private void ScheduleImageChanged(string hash, ClipboardChangedEventArgs args)
+    {
+        CancellationTokenSource cts;
+        lock (_pendingImageLock)
+        {
+            _pendingImageCts?.Cancel();
+            _pendingImageCts?.Dispose();
+            _pendingImageCts = new CancellationTokenSource();
+            cts = _pendingImageCts;
+        }
+
+        _ = PublishImageAfterSettleAsync(hash, args, cts.Token);
+    }
+
+    private async Task PublishImageAfterSettleAsync(string hash, ClipboardChangedEventArgs args, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(ImageSettleDelayMs, ct);
+            if (ct.IsCancellationRequested || _disposed) return;
+
+            var form = _clipboardForm;
+            if (form != null && form.IsHandleCreated && !form.IsDisposed)
+            {
+                form.BeginInvoke(new Action(() =>
+                {
+                    if (!ct.IsCancellationRequested && !_disposed)
+                    {
+                        PublishClipboardChanged(hash, args);
+                    }
+                }));
+                return;
+            }
+
+            PublishClipboardChanged(hash, args);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private void PublishClipboardChanged(string hash, ClipboardChangedEventArgs args)
+    {
+        lock (_hashLock)
+        {
+            if (hash == _lastHash) return;
+            _lastHash = hash;
+        }
+
+        lock (_debounceLock)
+        {
+            var now = DateTime.UtcNow;
+            if (hash == _debounceHash && (now - _lastChangeTime).TotalMilliseconds < DebounceMs) return;
+            _debounceHash = hash;
+            _lastChangeTime = now;
+        }
+
+        ClipboardChanged?.Invoke(this, args);
+    }
+
     public void UpdateClipboardSilently(string? text, byte[]? image, List<string>? files)
+    {
+        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
+        {
+            ApplyClipboardSilently(text, image, files);
+            return;
+        }
+
+        if (!_clipboardReady.Wait(TimeSpan.FromSeconds(3)))
+        {
+            _logger.Warn("Clipboard STA thread was not ready; remote clipboard update was skipped.");
+            return;
+        }
+
+        var form = _clipboardForm;
+        if (form == null || form.IsDisposed || !form.IsHandleCreated)
+        {
+            _logger.Warn("Clipboard STA form was not available; remote clipboard update was skipped.");
+            return;
+        }
+
+        form.Invoke(new Action(() => ApplyClipboardSilently(text, image, files)));
+    }
+
+    private void ApplyClipboardSilently(string? text, byte[]? image, List<string>? files)
     {
         _isApplyingRemote = true;
         try
@@ -197,12 +296,19 @@ public sealed class ClipboardMonitor : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        lock (_pendingImageLock)
+        {
+            _pendingImageCts?.Cancel();
+            _pendingImageCts?.Dispose();
+            _pendingImageCts = null;
+        }
         Stop();
+        _clipboardReady.Dispose();
     }
 
     private sealed class HiddenClipboardForm : Form
     {
-        private const int WM_QUIT_FORM = 0x0010;
+        internal const int WM_QUIT_FORM = 0x8001;
         private readonly ClipboardMonitor _owner;
         private readonly FileLogger _logger;
         private bool _addedListener;
@@ -244,7 +350,7 @@ public sealed class ClipboardMonitor : IDisposable
 
         protected override void Dispose(bool disposing)
         {
-            if (_addedListener && Handle != IntPtr.Zero)
+            if (_addedListener && IsHandleCreated)
             {
                 RemoveClipboardFormatListener(Handle);
             }

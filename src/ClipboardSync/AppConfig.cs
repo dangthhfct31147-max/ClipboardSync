@@ -31,4 +31,15 @@ public sealed class SyncConfig
 public sealed class AuthConfig
 {
     public string? Token { get; init; }
+
+    public string RequireToken()
+    {
+        if (string.IsNullOrWhiteSpace(Token) ||
+            string.Equals(Token.Trim(), "changeme", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException("Auth:Token must be set to a shared secret generated during install.");
+        }
+
+        return Token.Trim();
+    }
 }

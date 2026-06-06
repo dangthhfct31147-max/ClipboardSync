@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using ClipboardSync.Core;
 using ClipboardSync.Utils;
@@ -8,6 +9,7 @@ namespace ClipboardSync.Tray;
 public sealed class TrayIconManager : IDisposable
 {
     private NotifyIcon? _notifyIcon;
+    private Icon? _currentIcon;
     private readonly FileLogger _logger;
     private ContextMenuStrip? _contextMenu;
     private ToolStripMenuItem? _statusMenuItem;
@@ -16,7 +18,12 @@ public sealed class TrayIconManager : IDisposable
     private ToolStripMenuItem? _syncImagesMenuItem;
     private ToolStripMenuItem? _syncFilesMenuItem;
     private ToolStripMenuItem? _enableSyncMenuItem;
+    private bool? _iconShowsConnected;
+    private string _peerListSignature = string.Empty;
     private bool _disposed;
+
+    private static readonly Color DisconnectedColor = Color.FromArgb(30, 64, 175);
+    private static readonly Color ConnectedColor = Color.FromArgb(22, 163, 74);
 
     public TrayIconManager(FileLogger logger)
     {
@@ -51,9 +58,11 @@ public sealed class TrayIconManager : IDisposable
         _contextMenu.Items.Add(new ToolStripSeparator());
         _contextMenu.Items.Add(new ToolStripMenuItem("Exit", null, OnExit));
 
+        _currentIcon = CreateStatusIcon(peerCount: 0);
+        _iconShowsConnected = false;
         _notifyIcon = new NotifyIcon
         {
-            Icon = CreateDefaultIcon(),
+            Icon = _currentIcon,
             Text = "ClipboardSync",
             Visible = true,
             ContextMenuStrip = _contextMenu
@@ -63,19 +72,35 @@ public sealed class TrayIconManager : IDisposable
         _logger.Info("Tray icon initialized.");
     }
 
-    private static Icon CreateDefaultIcon()
+    public static Color GetIconBackColorForPeerCount(int peerCount) =>
+        peerCount > 0 ? ConnectedColor : DisconnectedColor;
+
+    private static Icon CreateStatusIcon(int peerCount)
     {
         using var bmp = new Bitmap(32, 32);
         using var g = Graphics.FromImage(bmp);
-        g.Clear(Color.FromArgb(30, 64, 175));
+        g.Clear(GetIconBackColorForPeerCount(peerCount));
         using var pen = new Pen(Color.White, 2);
         g.DrawRectangle(pen, 4, 8, 24, 16);
         g.FillRectangle(Brushes.White, 8, 12, 8, 8);
         g.FillRectangle(Brushes.White, 18, 12, 8, 8);
         g.FillRectangle(Brushes.White, 8, 14, 16, 2);
         g.FillRectangle(Brushes.White, 8, 18, 16, 2);
-        return Icon.FromHandle(bmp.GetHicon());
+
+        var iconHandle = bmp.GetHicon();
+        try
+        {
+            using var icon = Icon.FromHandle(iconHandle);
+            return (Icon)icon.Clone();
+        }
+        finally
+        {
+            DestroyIcon(iconHandle);
+        }
     }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
 
     public void UpdateStatus(string status)
     {
@@ -85,16 +110,26 @@ public sealed class TrayIconManager : IDisposable
 
     public void UpdatePeerList(IReadOnlyCollection<PeerInfo> peers)
     {
+        var peerList = peers
+            .OrderBy(peer => peer.PeerId, StringComparer.Ordinal)
+            .ToList();
+        UpdateIconForPeerCount(peerList.Count);
+
+        var signature = string.Join('\n', peerList.Select(peer =>
+            $"{peer.PeerId}|{peer.Hostname}|{peer.IpAddress}|{peer.TcpPort}"));
+        if (signature == _peerListSignature) return;
+        _peerListSignature = signature;
+
         if (_peerListMenuItem == null) return;
-        _peerListMenuItem.DropDownItems.Clear();
-        if (peers.Count == 0)
+        ClearDropDownItems(_peerListMenuItem);
+        if (peerList.Count == 0)
         {
             _peerListMenuItem.Text = "Peers: none";
         }
         else
         {
-            _peerListMenuItem.Text = $"Peers: {peers.Count}";
-            foreach (var peer in peers)
+            _peerListMenuItem.Text = $"Peers: {peerList.Count}";
+            foreach (var peer in peerList)
             {
                 var item = new ToolStripMenuItem($"{peer.Hostname} ({peer.IpAddress})", null, (_, _) =>
                 {
@@ -103,6 +138,30 @@ public sealed class TrayIconManager : IDisposable
                 _peerListMenuItem.DropDownItems.Add(item);
             }
         }
+    }
+
+    private void UpdateIconForPeerCount(int peerCount)
+    {
+        if (_notifyIcon == null) return;
+        var connected = peerCount > 0;
+        if (_iconShowsConnected == connected) return;
+
+        var newIcon = CreateStatusIcon(peerCount);
+        var previousIcon = _currentIcon;
+        _currentIcon = newIcon;
+        _iconShowsConnected = connected;
+        _notifyIcon.Icon = newIcon;
+        previousIcon?.Dispose();
+    }
+
+    private static void ClearDropDownItems(ToolStripMenuItem menuItem)
+    {
+        foreach (ToolStripItem item in menuItem.DropDownItems)
+        {
+            item.Dispose();
+        }
+
+        menuItem.DropDownItems.Clear();
     }
 
     public event EventHandler? ExitRequested;
@@ -167,6 +226,9 @@ public sealed class TrayIconManager : IDisposable
             _notifyIcon.Dispose();
             _notifyIcon = null;
         }
+        _currentIcon?.Dispose();
+        _currentIcon = null;
+        _iconShowsConnected = null;
         _contextMenu?.Dispose();
         _logger.Info("Tray icon disposed.");
     }

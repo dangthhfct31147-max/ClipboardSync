@@ -35,7 +35,11 @@ public sealed class PeerManager : IDisposable
 
     private void OnPeerDiscovered(object? sender, PeerDiscoveredEventArgs e)
     {
-        var peer = e.Peer;
+        RegisterOrUpdatePeer(e.Peer);
+    }
+
+    public void RegisterOrUpdatePeer(PeerInfo peer)
+    {
         if (_peers.TryGetValue(peer.PeerId, out var existing) &&
             existing.IpAddress == peer.IpAddress && existing.TcpPort == peer.TcpPort)
         {

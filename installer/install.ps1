@@ -1,149 +1,215 @@
-#Requires -RunAsAdministrator
-
 param(
-    [switch]$Uninstall
+    [string]$Token,
+    [switch]$Uninstall,
+    [switch]$NoStart
 )
 
 $ErrorActionPreference = "Stop"
 
-$exePath      = Join-Path $PSScriptRoot "ClipboardSync.exe"
-$serviceName  = "ClipboardSync"
-$appName      = "ClipboardSync"
-$displayName  = "ClipboardSync"
-$description  = "P2P Clipboard Sync for Windows"
-$logDir       = Join-Path $env:LOCALAPPDATA "ClipboardSync\logs"
+$exePath = Join-Path $PSScriptRoot "ClipboardSync.exe"
+$configPath = Join-Path $PSScriptRoot "appsettings.json"
+$taskName = "ClipboardSync"
+$appName = "ClipboardSync"
+$description = "Secure P2P clipboard sync for Windows"
+$logDir = Join-Path $env:LOCALAPPDATA "ClipboardSync\logs"
+$startupShortcut = Join-Path ([Environment]::GetFolderPath("Startup")) "ClipboardSync.lnk"
 
-# ----------------------------------------------------------------------
-# Uninstall — remove shortcut, Task Scheduler entry, and old service
-# ----------------------------------------------------------------------
-if ($Uninstall) {
-    Write-Host "Uninstalling ClipboardSync..." -ForegroundColor Yellow
+function Test-IsAdmin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
-    # Remove startup shortcut from user's startup folder
-    $startupDir = [Environment]::GetFolderPath("Startup")
-    $shortcutPath = Join-Path $startupDir "ClipboardSync.lnk"
-    if (Test-Path $shortcutPath) {
-        Remove-Item $shortcutPath -Force
-        Write-Host "  Startup shortcut removed." -ForegroundColor Cyan
+function ConvertTo-Base64Url([byte[]]$Bytes) {
+    return [Convert]::ToBase64String($Bytes).TrimEnd("=").Replace("+", "-").Replace("/", "_")
+}
+
+function New-ClipboardSyncToken {
+    $bytes = New-Object byte[] 32
+    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    return ConvertTo-Base64Url $bytes
+}
+
+function Save-Token([string]$Value) {
+    if (-not (Test-Path $configPath)) {
+        throw "appsettings.json not found at $configPath"
     }
 
-    # Remove Task Scheduler entry (if installed)
-    $taskName = "ClipboardSync"
+    $json = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    if (-not $json.Auth) {
+        $json | Add-Member -MemberType NoteProperty -Name Auth -Value ([pscustomobject]@{})
+    }
+    $json.Auth.Token = $Value
+    $json | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
+}
+
+function Get-ConfigToken {
+    if (-not (Test-Path $configPath)) { return "" }
+    try {
+        $json = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        return [string]$json.Auth.Token
+    } catch {
+        return ""
+    }
+}
+
+function Remove-Startup {
     $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existingTask) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-        Write-Host "  Scheduled task removed." -ForegroundColor Cyan
+        try {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+            Write-Host "  Scheduled task removed." -ForegroundColor Cyan
+        } catch {
+            Write-Host "  Could not remove existing scheduled task: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 
-    # Clean up old Windows Service (if any — for users migrating from old version)
-    $svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-    if ($svc) {
-        if ($svc.Status -eq 'Running') {
-            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-        }
-        & sc.exe delete $serviceName 2>$null | Out-Null
-        Write-Host "  Old Windows Service removed." -ForegroundColor Cyan
+    if (Test-Path $startupShortcut) {
+        Remove-Item -LiteralPath $startupShortcut -Force
+        Write-Host "  Startup shortcut removed." -ForegroundColor Cyan
+    }
+}
+
+function Stop-ClipboardSyncProcesses {
+    $running = Get-Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProcessName -like "ClipboardSync*" }
+
+    if ($running) {
+        $running | Stop-Process -Force
+        Write-Host "  Running ClipboardSync processes stopped." -ForegroundColor Cyan
+    }
+}
+
+function Register-Startup {
+    Remove-Startup
+
+    $action = New-ScheduledTaskAction -Execute $exePath -WorkingDirectory $PSScriptRoot
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+        -LogonType Interactive `
+        -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -Hidden
+
+    try {
+        Register-ScheduledTask `
+            -TaskName $taskName `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings `
+            -Description $description `
+            -ErrorAction Stop | Out-Null
+        Write-Host "  Startup task registered for the current user." -ForegroundColor Gray
+        return
+    } catch {
+        Write-Host "  Task Scheduler registration failed, using Startup shortcut fallback." -ForegroundColor Yellow
+    }
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($startupShortcut)
+    $shortcut.TargetPath = $exePath
+    $shortcut.WorkingDirectory = $PSScriptRoot
+    $shortcut.Description = $description
+    $shortcut.WindowStyle = 7
+    $shortcut.Save()
+    Write-Host "  Startup shortcut created: $startupShortcut" -ForegroundColor Gray
+}
+
+function Add-FirewallRulesIfPossible {
+    if (-not (Test-IsAdmin)) {
+        Write-Host "  Firewall rules not changed because this shell is not elevated." -ForegroundColor Yellow
+        Write-Host "  If peers cannot connect, run this once as Administrator:" -ForegroundColor Yellow
+        Write-Host "    New-NetFirewallRule -DisplayName ClipboardSync -Direction Inbound -Program `"$exePath`" -Action Allow" -ForegroundColor Gray
+        return
+    }
+
+    $existing = Get-NetFirewallRule -DisplayName $appName -ErrorAction SilentlyContinue
+    if ($existing) {
+        $existing | Remove-NetFirewallRule
+    }
+
+    New-NetFirewallRule `
+        -DisplayName $appName `
+        -Direction Inbound `
+        -Program $exePath `
+        -Action Allow `
+        -Profile Private `
+        -Description $description | Out-Null
+
+    Write-Host "  Firewall rule added for Private networks." -ForegroundColor Gray
+}
+
+if ($Uninstall) {
+    Write-Host "Uninstalling ClipboardSync..." -ForegroundColor Yellow
+    Remove-Startup
+
+    Stop-ClipboardSyncProcesses
+
+    if (Test-IsAdmin) {
+        Get-NetFirewallRule -DisplayName $appName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        Write-Host "  Firewall rule removed." -ForegroundColor Cyan
     }
 
     Write-Host ""
-    Write-Host "ClipboardSync has been uninstalled." -ForegroundColor Green
-    Write-Host "Application files in this folder are untouched." -ForegroundColor Gray
+    Write-Host "ClipboardSync has been uninstalled. Application files were left in place." -ForegroundColor Green
     exit 0
 }
 
-# ----------------------------------------------------------------------
-# Pre-flight checks
-# ----------------------------------------------------------------------
-Write-Host "Running pre-flight checks..." -ForegroundColor Cyan
+Write-Host "Installing ClipboardSync..." -ForegroundColor Cyan
 
 if (-not (Test-Path $exePath)) {
-    Write-Host "ERROR: ClipboardSync.exe not found at:" -ForegroundColor Red
-    Write-Host "  $exePath" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Run publish.ps1 first to build the project." -ForegroundColor Yellow
-    exit 1
+    throw "ClipboardSync.exe not found. Run .\publish.ps1 first."
 }
 
-if (-not (Test-Path (Join-Path $PSScriptRoot "appsettings.json"))) {
-    Write-Host "ERROR: appsettings.json not found in installer folder." -ForegroundColor Red
-    Write-Host "Run publish.ps1 first to copy all required files." -ForegroundColor Yellow
-    exit 1
+if (-not (Test-Path $configPath)) {
+    throw "appsettings.json not found. Run .\publish.ps1 first."
 }
 
-# ----------------------------------------------------------------------
-# Remove old Windows Service if it exists (from old version)
-# ----------------------------------------------------------------------
-$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-if ($svc) {
-    Write-Host "Removing old Windows Service..." -ForegroundColor Yellow
-    if ($svc.Status -eq 'Running') {
-        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+$configuredToken = Get-ConfigToken
+$generatedToken = $false
+if ($PSBoundParameters.ContainsKey("Token") -and [string]::IsNullOrWhiteSpace($Token)) {
+    throw 'Token cannot be empty. On the first machine run .\setup.ps1 -Machine 1, then copy the printed token command to the second machine.'
+}
+
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    if ([string]::IsNullOrWhiteSpace($configuredToken) -or $configuredToken.Trim().ToLowerInvariant() -eq "changeme") {
+        $Token = New-ClipboardSyncToken
+        $generatedToken = $true
+    } else {
+        $Token = $configuredToken.Trim()
     }
-    & sc.exe delete $serviceName 2>$null | Out-Null
 }
 
-# ----------------------------------------------------------------------
-# Create startup shortcut (Start Menu / user startup)
-# ----------------------------------------------------------------------
-Write-Host "Creating startup shortcut..." -ForegroundColor Cyan
+Save-Token $Token
+Register-Startup
+Add-FirewallRulesIfPossible
 
-$WshShell = New-Object -ComObject WScript.Shell
-$startupPath = Join-Path ([Environment]::GetFolderPath("Startup")) "ClipboardSync.lnk"
-$shortcut = $WshShell.CreateShortcut($startupPath)
-$shortcut.TargetPath = $exePath
-$shortcut.WorkingDirectory = $PSScriptRoot
-$shortcut.Description = "P2P Clipboard Sync for Windows"
-$shortcut.WindowStyle = 1  # Normal window
-$shortcut.Save()
-
-Write-Host "  Startup shortcut created: $startupPath" -ForegroundColor Gray
-
-# ----------------------------------------------------------------------
-# Register with Task Scheduler (hidden startup for better UX)
-# ----------------------------------------------------------------------
-Write-Host "Registering startup task..." -ForegroundColor Cyan
-
-$taskAction = New-ScheduledTaskAction -Execute $exePath -WorkingDirectory $PSScriptRoot
-$taskTrigger = New-ScheduledTaskTrigger -AtLogOn
-$taskPrincipal = New-ScheduledTaskPrincipal -GroupId "S-1-5-21-$(whoami /user | Select-Object -Skip 3 | ForEach-Object { $_.Trim() })" -RunLevel Limited
-
-# Fallback: use current user if above fails
-if (-not $taskPrincipal.GroupId) {
-    $taskPrincipal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -RunLevel Limited
-}
-
-$taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-
-# Remove existing task if any
-$existingTask = Get-ScheduledTask -TaskName $serviceName -ErrorAction SilentlyContinue
-if ($existingTask) {
-    Unregister-ScheduledTask -TaskName $serviceName -Confirm:$false
-}
-
-Register-ScheduledTask -TaskName $serviceName -Action $taskAction -Trigger $taskTrigger `
-    -Settings $taskSettings -Principal $taskPrincipal -Description $description | Out-Null
-
-Write-Host "  Startup task registered (runs at logon)." -ForegroundColor Gray
-
-# ----------------------------------------------------------------------
-# Ensure log directory exists
-# ----------------------------------------------------------------------
 try {
-    [void][System.IO.Directory]::CreateDirectory($logDir)
+    [void][IO.Directory]::CreateDirectory($logDir)
 } catch {
-    Write-Host "  Note: Could not create log directory. Logs will go to: $logDir" -ForegroundColor Gray
+    Write-Host "  Could not create log directory: $logDir" -ForegroundColor Yellow
 }
 
-# ----------------------------------------------------------------------
-# Launch the app now
-# ----------------------------------------------------------------------
-Write-Host "Launching ClipboardSync..." -ForegroundColor Cyan
-Start-Process $exePath -WorkingDirectory $PSScriptRoot
-
-Start-Sleep -Seconds 2
+if (-not $NoStart) {
+    Stop-ClipboardSyncProcesses
+    Start-Process -FilePath $exePath -WorkingDirectory $PSScriptRoot -WindowStyle Hidden
+    Write-Host "  ClipboardSync started." -ForegroundColor Gray
+}
 
 Write-Host ""
-Write-Host "SUCCESS — ClipboardSync is installed and running!" -ForegroundColor Green
-Write-Host "  Look for the clipboard icon in your system tray." -ForegroundColor Green
-Write-Host "  Logs are at: $logDir" -ForegroundColor Gray
-Write-Host "  To uninstall: .\install.ps1 -Uninstall" -ForegroundColor Gray
+Write-Host "SUCCESS: ClipboardSync is installed for the current user." -ForegroundColor Green
+Write-Host "  Tray app: look for ClipboardSync in the system tray." -ForegroundColor Gray
+Write-Host "  Logs: $logDir" -ForegroundColor Gray
+Write-Host "  Uninstall: .\install.ps1 -Uninstall" -ForegroundColor Gray
+
+if ($generatedToken) {
+    Write-Host ""
+    Write-Host "Pair another Windows machine with this command:" -ForegroundColor Yellow
+    Write-Host "  .\setup.ps1 -Machine 2 -Token `"$Token`"" -ForegroundColor White
+    Write-Host "Keep this token private. Anyone with it can join this clipboard sync group." -ForegroundColor Yellow
+}
